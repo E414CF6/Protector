@@ -1,0 +1,48 @@
+name: Protector
+version: '${version}'
+main: protector.Protector
+api-version: '1.20'
+folia-supported: true
+description: Integrated land protection, forensic audit logging, and modern UI plugin for Paper.
+authors: [ Protector ]
+
+commands:
+  protector:
+    description: Open the Protector dashboard GUI or execute subcommands
+    usage: /protector [claim|claims|settings|trust|untrust|extend|transfer|restrict|abandon|abandonall|unlockdrops|inspect|near|lookup|rollback|restore|apply|cancel|undo|purge|admin|status|reload|trapped|alias|aliases]
+    aliases: [ pr, pt ]
+    permission: protector.use
+
+permissions:
+  protector.use:
+    description: Access the Protector dashboard and basic commands
+    default: true
+  protector.claim:
+    description: Create, abandon, and manage personal claims and trusts
+    default: true
+  protector.inspect:
+    description: Inspect block and container audit history
+    default: op
+  protector.lookup:
+    description: Query audit logs
+    default: op
+  protector.rollback:
+    description: Preview and execute rollbacks
+    default: op
+  protector.restore:
+    description: Execute restores and undos
+    default: op
+  protector.purge:
+    description: Purge old audit logs
+    default: op
+  protector.admin:
+    description: Bypass all claim protections, manage admin claims, and reload config
+    default: op
+    children:
+      protector.use: true
+      protector.claim: true
+      protector.inspect: true
+      protector.lookup: true
+      protector.rollback: true
+      protector.restore: true
+      protector.purge: true
