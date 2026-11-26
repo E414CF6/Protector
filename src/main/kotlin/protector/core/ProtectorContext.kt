@@ -2,139 +2,81 @@ package protector.core
 
 import org.bukkit.plugin.java.JavaPlugin
 import protector.core.command.CommandAliasService
-import protector.core.command.ProtectorCommandRegistry
+import protector.core.command.CommandRegistry
+import protector.core.config.GuardSettings
 import protector.core.config.ProtectorConfig
 import protector.core.locale.MessageService
 import protector.core.module.ModuleRegistry
-import protector.core.scheduler.ProtectorScheduler
-import protector.core.storage.AuditLogRepository
-import protector.core.storage.ClaimRepository
+import protector.core.scheduler.PluginScheduler
 import protector.core.storage.DatabaseManager
-import protector.core.storage.IdMappingCache
-import protector.core.ui.ActionBarHudService
+import protector.core.ui.ActionBarService
 import protector.core.ui.BossBarService
-import protector.core.ui.DialogService
-import protector.core.ui.MenuService
-import protector.modules.audit.InspectorService
-import protector.modules.audit.LogQueueConsumer
-import protector.modules.audit.RollbackService
-import protector.modules.claim.BoundaryVisualizer
-import protector.modules.claim.ClaimManager
-import protector.modules.claim.ClaimToolService
-import protector.modules.claim.DeathDropProtectionService
+import protector.core.ui.DialogKit
 import java.io.File
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
-/**
- * Central service container wiring core infrastructure, UI, command aliases, and modules
- * (modeled after Obsidian's ObsidianContext).
- */
-class ProtectorContext(val plugin: JavaPlugin) {
+class ProtectorContext(override val plugin: JavaPlugin) : CoreHost {
 
     @Volatile
     var config: ProtectorConfig = ProtectorConfig.load(plugin)
         private set
 
-    val messages = MessageService(plugin).apply { reload(config.language) }
-    val scheduler = ProtectorScheduler(plugin)
+    override val messages = MessageService(plugin).apply { reload(config.language) }
+    override val scheduler = PluginScheduler(plugin)
+    val database = DatabaseManager(File(plugin.dataFolder, config.databaseFile), config.databasePoolSize, "Protector-SQLite")
 
-    val database = DatabaseManager(File(plugin.dataFolder, config.databaseFile), config.databasePoolSize)
-    val idMappingCache = IdMappingCache(database).apply { warmUp() }
-    val claimRepository = ClaimRepository(database)
-    val auditLogRepository = AuditLogRepository(database, idMappingCache)
+    override val bossBar = BossBarService(scheduler) { config.bossBarEnabled }
+    override val actionBar = ActionBarService(scheduler, { config.actionBarSettings() }, messages)
+    val dialogs = DialogKit(messages)
 
-    val claimManager = ClaimManager(scheduler, claimRepository) { config }
-    val boundaryVisualizer = BoundaryVisualizer(scheduler) { config }
-    val bossBar = BossBarService(scheduler) { config }
-    val actionBar = ActionBarHudService(scheduler, { config }, messages, claimManager, bossBar)
-    val deathDrops = DeathDropProtectionService(plugin, { config }, messages, actionBar)
-    val claimToolService = ClaimToolService(
-        { config },
-        messages,
-        claimManager,
-        boundaryVisualizer,
-        actionBar,
-        bossBar
+    val modules = ModuleRegistry(plugin) { id, defaultEnabled -> config.isModuleEnabled(id, defaultEnabled) }
+    override val commandRegistry = CommandRegistry()
+
+    val adminBypassPlayers: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
+
+    override val pluginDisplayName: String = "Protector"
+    override val rootCommandName: String = "protector"
+    override val rootAliases: Set<String> = setOf("pr", "pt")
+    override val registerStandaloneAliases: Boolean get() = config.registerStandaloneAliases
+    override val adminPermission: String = "protector.admin"
+    override val customAliasPermissionPrefix: String = "protector.customalias."
+    override val defaultCustomAliases: Map<String, List<String>> = linkedMapOf(
+        "auditnear" to listOf("player: protector near 15"),
+        "tntguard" to listOf("player: protector guard"),
+        "prhelp" to listOf(
+            "msg: <aqua><bold>Protector Guide:</bold></aqua> <gray>Use <white>/pr</white> for the dashboard, <white>/inspect</white> for block history, or <white>/guard</white> for world rules.</gray>"
+        ),
     )
 
-    val logQueueConsumer = LogQueueConsumer(auditLogRepository, { config }, plugin.logger)
-    val rollbackService = RollbackService(
-        scheduler,
-        { config },
-        messages,
-        auditLogRepository,
-        logQueueConsumer,
-        bossBar
-    )
-    val inspectorService = InspectorService(
-        scheduler,
-        messages,
-        auditLogRepository,
-        logQueueConsumer,
-        actionBar
-    )
-
-    val dialogs = DialogService(
-        plugin,
-        { config },
-        messages,
-        claimManager,
-        rollbackService,
-        auditLogRepository,
-        logQueueConsumer
-    )
-    val menus = MenuService(
-        plugin,
-        scheduler,
-        { config },
-        messages,
-        claimManager,
-        boundaryVisualizer,
-        actionBar,
-        bossBar,
-        deathDrops,
-        inspectorService,
-        rollbackService,
-        dialogs,
-        auditLogRepository,
-        logQueueConsumer
-    )
-
-    val modules = ModuleRegistry(plugin) { config }
-    val commandRegistry = ProtectorCommandRegistry()
     val commandAliases = CommandAliasService(this)
 
-    init {
-        actionBar.hasLockedDrops = { uuid -> deathDrops.hasLockedDrops(uuid) }
-        inspectorService.onOpenInspectDialog = { player, loc, bLogs, cLogs ->
-            dialogs.openInspectDetailDialog(player, loc, bLogs, cLogs)
-        }
-        dialogs.onOpenAuditMenu = { player, filter ->
-            menus.openAuditBrowserAsync(player, filter, 0)
-        }
-        dialogs.onReopenClaimDetail = { player, claim ->
-            menus.openClaimDetail(player, claim)
-        }
-        dialogs.onFallbackConfirmation = { player, title, body, onConfirm ->
-            menus.openConfirmationMenu(player, title, body, onConfirm)
-        }
-        dialogs.onFallbackClaimFlags = { player, claim ->
-            menus.openClaimFlagsMenu(player, claim)
-        }
-        dialogs.onFallbackTrustSelect = { player, claim ->
-            menus.openTrustSelectPlayerMenu(player, claim)
-        }
-        dialogs.onFallbackTransferSelect = { player, claim ->
-            menus.openTransferSelectPlayerMenu(player, claim)
-        }
-        dialogs.onFallbackRollbackPreset = { player, restoreMode ->
-            menus.openRollbackPresetMenu(player, restoreMode)
-        }
-        dialogs.onFallbackAdminBlocks = { player ->
-            menus.openAdminClaimBlocksMenu(player)
-        }
+    fun updateGuardSettings(transform: (GuardSettings) -> GuardSettings) {
+        val nextGuard = transform(config.guard)
+        config = config.copy(guard = nextGuard)
+        val raw = plugin.config
+        raw.set("guard.protect-death-drops", nextGuard.protectDeathDrops)
+        raw.set("guard.tnt.prevent-prime", nextGuard.tntPreventPrime)
+        raw.set("guard.tnt.prevent-block-damage", nextGuard.tntPreventBlockDamage)
+        raw.set("guard.tnt.prevent-entity-damage", nextGuard.tntPreventEntityDamage)
+        raw.set("guard.tnt.prevent-minecart-tnt", nextGuard.tntPreventMinecart)
+        raw.set("guard.explosions.prevent-creeper-block-damage", nextGuard.preventCreeperBlockDamage)
+        raw.set("guard.explosions.prevent-wither-damage", nextGuard.preventWitherDamage)
+        raw.set("guard.explosions.prevent-fireball-block-damage", nextGuard.preventFireballBlockDamage)
+        raw.set("guard.explosions.prevent-end-crystal-damage", nextGuard.preventEndCrystalDamage)
+        raw.set("guard.explosions.prevent-bed-anchor-explode", nextGuard.preventBedAnchorExplode)
+        raw.set("guard.fire.prevent-fire-spread", nextGuard.preventFireSpread)
+        raw.set("guard.fire.prevent-block-burn", nextGuard.preventBlockBurn)
+        raw.set("guard.fire.prevent-lava-fire-spread", nextGuard.preventLavaFireSpread)
+        raw.set("guard.fire.prevent-lightning-fire", nextGuard.preventLightningFire)
+        raw.set("guard.mobs.prevent-enderman-grief", nextGuard.preventEndermanGrief)
+        raw.set("guard.mobs.prevent-ravager-grief", nextGuard.preventRavagerGrief)
+        raw.set("guard.mobs.prevent-wither-block-break", nextGuard.preventWitherBlockBreak)
+        raw.set("guard.world.prevent-non-player-portals", nextGuard.preventNonPlayerPortals)
+        runCatching { plugin.saveConfig() }
     }
 
-    fun reloadAll() {
+    override fun reloadAll() {
         config = ProtectorConfig.load(plugin)
         messages.reload(config.language)
         actionBar.start()

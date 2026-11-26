@@ -5,11 +5,7 @@ import org.bukkit.command.CommandSender
 import org.bukkit.command.defaults.BukkitCommand
 import java.util.Locale
 
-/**
- * Dynamic [BukkitCommand] proxy registered into `CommandMap` for each enabled alias in
- * `command-aliases.yml` / `aliases.yml` (modeled after Obsidian's ObsidianAliasCommand).
- */
-class ProtectorAliasCommand(
+class AliasCommandProxy(
     aliasName: String,
     private val service: CommandAliasService,
     commandDescription: String,

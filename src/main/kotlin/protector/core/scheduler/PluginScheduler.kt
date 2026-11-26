@@ -16,10 +16,7 @@ fun interface TaskHandle {
     fun cancel()
 }
 
-/**
- * Paper / Folia / Legacy Bukkit-compatible scheduler and CoroutineScope bridge.
- */
-class ProtectorScheduler(private val plugin: Plugin?) {
+class PluginScheduler(private val plugin: Plugin?) {
     private val rootJob = SupervisorJob()
     val asyncScope: CoroutineScope = CoroutineScope(rootJob + Dispatchers.IO)
 
@@ -47,7 +44,12 @@ class ProtectorScheduler(private val plugin: Plugin?) {
     fun runAsyncDelayed(delayMillis: Long, task: () -> Unit): TaskHandle? {
         val host = plugin ?: return null
         return if (useFolia) {
-            val st = Bukkit.getAsyncScheduler().runDelayed(host, { task() }, delayMillis.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+            val st = Bukkit.getAsyncScheduler().runDelayed(
+                host,
+                { task() },
+                delayMillis.coerceAtLeast(1L),
+                TimeUnit.MILLISECONDS
+            )
             TaskHandle { st.cancel() }
         } else {
             val ticks = (delayMillis / 50L).coerceAtLeast(1L)

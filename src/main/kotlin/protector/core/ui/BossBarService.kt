@@ -4,14 +4,13 @@ import net.kyori.adventure.bossbar.BossBar
 import net.kyori.adventure.text.Component
 import org.bukkit.Bukkit
 import org.bukkit.entity.Player
-import protector.core.config.ProtectorConfig
-import protector.core.scheduler.ProtectorScheduler
+import protector.core.scheduler.PluginScheduler
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class BossBarService(
-    private val scheduler: ProtectorScheduler,
-    private val configProvider: () -> ProtectorConfig
+    private val scheduler: PluginScheduler,
+    private val enabledProvider: () -> Boolean,
 ) {
     private val playerBars = ConcurrentHashMap<UUID, ConcurrentHashMap<String, BossBar>>()
 
@@ -21,9 +20,9 @@ class BossBarService(
         title: Component,
         progress: Float,
         color: BossBar.Color = BossBar.Color.BLUE,
-        overlay: BossBar.Overlay = BossBar.Overlay.PROGRESS
+        overlay: BossBar.Overlay = BossBar.Overlay.PROGRESS,
     ) {
-        if (!configProvider().bossBarEnabled) return
+        if (!enabledProvider()) return
         val bars = playerBars.computeIfAbsent(player.uniqueId) { ConcurrentHashMap() }
         val clamped = progress.coerceIn(0f, 1f)
         val existing = bars[key]
@@ -44,9 +43,9 @@ class BossBarService(
         key: String,
         title: Component,
         color: BossBar.Color = BossBar.Color.GREEN,
-        delayTicks: Long = 60L
+        delayTicks: Long = 60L,
     ) {
-        if (!configProvider().bossBarEnabled) return
+        if (!enabledProvider()) return
         showOrUpdate(player, key, title, 1f, color, BossBar.Overlay.PROGRESS)
         scheduler.runForEntityDelayed(player, delayTicks) {
             hide(player, key)

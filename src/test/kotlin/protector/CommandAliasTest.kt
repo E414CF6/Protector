@@ -6,18 +6,18 @@ import org.junit.jupiter.api.Test
 import protector.core.command.AliasMatcher
 import protector.core.command.CommandAliasEntry
 import protector.core.command.CommandAliasType
-import protector.core.command.ProtectorCommandRegistry
+import protector.core.command.CommandRegistry
 
 class CommandAliasTest {
 
     @Test
     fun `AliasMatcher resolves exact, prefix with dynamic vars, disabled, and wildcard aliases`() {
-        val claimAlias = CommandAliasEntry(
-            alias = "claim",
-            commands = listOf("protector claim \$1-"),
+        val guardAlias = CommandAliasEntry(
+            alias = "guard",
+            commands = listOf("protector guard \$1-"),
             enabled = true,
             type = CommandAliasType.BASE,
-            targetSubcommand = "claim"
+            targetSubcommand = "guard"
         )
         val exactStatusAlias = CommandAliasEntry(
             alias = "pstat",
@@ -34,50 +34,30 @@ class CommandAliasTest {
             targetSubcommand = "inspect"
         )
         val wildcardAlias = CommandAliasEntry(
-            alias = "myclaim ?",
-            commands = listOf("protector claim \$1-"),
+            alias = "myrb ?",
+            commands = listOf("protector rollback \$1-"),
             enabled = true,
             type = CommandAliasType.CUSTOM
         )
 
         val map = linkedMapOf(
-            "claim" to claimAlias,
+            "guard" to guardAlias,
             "pstat" to exactStatusAlias,
             "coi" to disabledAlias,
-            "myclaim ?" to wildcardAlias
+            "myrb ?" to wildcardAlias
         )
 
-        // Exact match and dynamic prefix match
-        assertEquals(claimAlias, AliasMatcher.findBestMatch("claim", map))
-        assertEquals(claimAlias, AliasMatcher.findBestMatch("claim 10", map))
-
-        // Exact-only custom alias does not match trailing arguments
+        assertEquals(guardAlias, AliasMatcher.findBestMatch("guard", map))
+        assertEquals(guardAlias, AliasMatcher.findBestMatch("guard tnt-block off", map))
         assertEquals(exactStatusAlias, AliasMatcher.findBestMatch("pstat", map))
         assertNull(AliasMatcher.findBestMatch("pstat extra", map))
-
-        // Disabled alias is ignored
         assertNull(AliasMatcher.findBestMatch("coi", map))
-
-        // Wildcard `?` fallback matches trailing tokens
-        assertEquals(wildcardAlias, AliasMatcher.findBestMatch("myclaim 15", map))
-        assertEquals(wildcardAlias, AliasMatcher.findBestMatch("myclaim", map))
+        assertEquals(wildcardAlias, AliasMatcher.findBestMatch("myrb t:1h", map))
+        assertEquals(wildcardAlias, AliasMatcher.findBestMatch("myrb", map))
     }
 
     @Test
     fun `AliasMatcher expands positional arguments, rest args, {args}, and {player}`() {
-        val trustAlias = CommandAliasEntry(
-            alias = "trust",
-            commands = listOf("protector trust \$1 \$2", "msg:\$1 was granted {args} by {player}")
-        )
-        val expanded = AliasMatcher.expandCommands(trustAlias, "trust Alice build", "OwnerSteve")
-        assertEquals(
-            listOf(
-                "protector trust Alice build",
-                "msg:Alice was granted Alice build by OwnerSteve"
-            ),
-            expanded
-        )
-
         val restAlias = CommandAliasEntry(
             alias = "rb",
             commands = listOf("protector rollback \$1-")
@@ -94,32 +74,28 @@ class CommandAliasTest {
 
     @Test
     fun `AliasMatcher identifies specialized alias lists vs simple single-command aliases`() {
-        assertFalse(AliasMatcher.isSpecializedAlias(listOf("protector claim \$1-")))
+        assertFalse(AliasMatcher.isSpecializedAlias(listOf("protector guard \$1-")))
         assertTrue(AliasMatcher.isSpecializedAlias(listOf("console:say hi")))
         assertTrue(AliasMatcher.isSpecializedAlias(listOf("msg:hello")))
         assertTrue(AliasMatcher.isSpecializedAlias(listOf("protector inspect", "sound:UI_BUTTON_CLICK")))
     }
 
     @Test
-    fun `ProtectorCommandRegistry registers and resolves subcommands and aliases case-insensitively`() {
-        val registry = ProtectorCommandRegistry()
-        var executedWith = emptyList<String>()
-
+    fun `CommandRegistry registers and resolves subcommands and aliases case-insensitively`() {
+        val registry = CommandRegistry()
         registry.registerSubcommand(
             name = "Lookup",
             description = "Query audit history",
             permission = "protector.lookup",
             aliases = listOf("l", "search")
-        ) { _: CommandSender, args: Array<out String> ->
-            executedWith = args.toList()
-            true
-        }
+        ) { _: CommandSender, _: Array<out String> -> true }
 
         val byName = registry.getSubcommand("lookup")
         val byAlias = registry.getSubcommand("L")
         assertNotNull(byName)
         assertEquals(byName, byAlias)
         assertEquals(listOf("l", "search"), byName?.aliases)
+        assertTrue(byName!!.standaloneByDefault)
         assertEquals(1, registry.allSubcommands().size)
         assertNull(registry.getSubcommand("missing"))
     }

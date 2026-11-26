@@ -1,16 +1,7 @@
 package protector.modules.audit
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import protector.core.config.ProtectorConfig
-import protector.core.storage.AuditLogRepository
-import protector.core.storage.PendingAuditEvent
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -23,6 +14,7 @@ class LogQueueConsumer(
 ) {
     private val queue = ConcurrentLinkedQueue<PendingAuditEvent>()
     private val running = AtomicBoolean(false)
+    val paused = AtomicBoolean(false)
     private var scope: CoroutineScope? = null
     private var workerJob: Job? = null
 
@@ -42,7 +34,7 @@ class LogQueueConsumer(
         workerJob = newScope.launch {
             while (isActive && running.get()) {
                 val cfg = configProvider()
-                if (queue.isNotEmpty()) {
+                if (!paused.get() && queue.isNotEmpty()) {
                     flushBatch(cfg.consumerBatchSize)
                 }
                 delay(cfg.consumerFlushIntervalMs)
@@ -62,6 +54,7 @@ class LogQueueConsumer(
 
     fun shutdownAndDrain() {
         running.set(false)
+        paused.set(false)
         workerJob?.cancel()
         scope?.cancel()
         scope = null

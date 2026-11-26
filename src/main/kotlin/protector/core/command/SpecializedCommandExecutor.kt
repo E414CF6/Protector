@@ -5,26 +5,22 @@ import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
 import org.bukkit.Registry
 import org.bukkit.entity.Player
-import protector.core.ProtectorContext
+import protector.core.CoreHost
 
-/**
- * Shared specialized action dispatcher for custom aliases (`aliases.yml`),
- * supporting `console:`, `player:`, `op:`, `msg:`, `broadcast:`, `actionbar:`, `bossbar:`, `sound:`, and `delay!`.
- */
 object SpecializedCommandExecutor {
 
     fun executeAll(
-        context: ProtectorContext,
+        host: CoreHost,
         rawLines: List<String>,
         player: Player? = null,
         extraPlaceholders: Map<String, String> = emptyMap(),
     ) {
         if (rawLines.isEmpty()) return
-        executeFromIndex(context, rawLines, 0, player, extraPlaceholders)
+        executeFromIndex(host, rawLines, 0, player, extraPlaceholders)
     }
 
     private fun executeFromIndex(
-        context: ProtectorContext,
+        host: CoreHost,
         lines: List<String>,
         index: Int,
         player: Player?,
@@ -41,23 +37,23 @@ object SpecializedCommandExecutor {
                 val nextIdx = i
                 if (nextIdx >= lines.size) return
                 if (player != null && player.isOnline) {
-                    context.scheduler.runForEntityDelayed(player, delayTicks) {
-                        executeFromIndex(context, lines, nextIdx, player, extraPlaceholders)
+                    host.scheduler.runForEntityDelayed(player, delayTicks) {
+                        executeFromIndex(host, lines, nextIdx, player, extraPlaceholders)
                     }
                 } else {
-                    context.scheduler.runGlobalDelayed(delayTicks) {
-                        executeFromIndex(context, lines, nextIdx, player, extraPlaceholders)
+                    host.scheduler.runGlobalDelayed(delayTicks) {
+                        executeFromIndex(host, lines, nextIdx, player, extraPlaceholders)
                     }
                 }
                 return
             }
 
-            executeSingleLine(context, raw, player, extraPlaceholders)
+            executeSingleLine(host, raw, player, extraPlaceholders)
         }
     }
 
     private fun executeSingleLine(
-        context: ProtectorContext,
+        host: CoreHost,
         rawLine: String,
         player: Player?,
         extraPlaceholders: Map<String, String>,
@@ -69,7 +65,7 @@ object SpecializedCommandExecutor {
             lower.startsWith("console:") -> {
                 val cmd = resolved.substring(8).trim().removePrefix("/")
                 if (cmd.isNotEmpty()) {
-                    context.scheduler.runGlobal {
+                    host.scheduler.runGlobal {
                         Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd)
                     }
                 }
@@ -79,7 +75,7 @@ object SpecializedCommandExecutor {
                 val target = player ?: return
                 val cmd = resolved.substring(7).trim().removePrefix("/")
                 if (cmd.isNotEmpty()) {
-                    context.scheduler.runForEntity(target) {
+                    host.scheduler.runForEntity(target) {
                         Bukkit.dispatchCommand(target, cmd)
                     }
                 }
@@ -89,7 +85,7 @@ object SpecializedCommandExecutor {
                 val target = player ?: return
                 val cmd = resolved.substring(3).trim().removePrefix("/")
                 if (cmd.isNotEmpty()) {
-                    context.scheduler.runForEntity(target) {
+                    host.scheduler.runForEntity(target) {
                         val wasOp = target.isOp
                         try {
                             if (!wasOp) target.isOp = true
@@ -103,7 +99,7 @@ object SpecializedCommandExecutor {
 
             lower.startsWith("msg:") || lower.startsWith("message:") -> {
                 val payload = resolved.substringAfter(':').trim()
-                val comp = context.messages.renderRaw(payload)
+                val comp = host.messages.renderRaw(payload)
                 if (player != null) {
                     player.sendMessage(comp)
                 } else {
@@ -113,13 +109,13 @@ object SpecializedCommandExecutor {
 
             lower.startsWith("broadcast:") || lower.startsWith("bc:") -> {
                 val payload = resolved.substringAfter(':').trim()
-                Bukkit.broadcast(context.messages.renderRaw(payload))
+                Bukkit.broadcast(host.messages.renderRaw(payload))
             }
 
             lower.startsWith("actionbar:") -> {
                 val target = player ?: return
                 val payload = resolved.substring(10).trim()
-                context.actionBar.flash(target, context.messages.renderRaw(payload))
+                host.actionBar.flash(target, host.messages.renderRaw(payload))
             }
 
             lower.startsWith("bossbar:") -> {
@@ -130,10 +126,10 @@ object SpecializedCommandExecutor {
                 }.getOrDefault(BossBar.Color.YELLOW)
                 val seconds = parts.getOrNull(1)?.trim()?.toIntOrNull()?.coerceIn(1, 300) ?: 5
                 val msg = parts.getOrNull(2)?.trim() ?: parts.last().trim()
-                context.bossBar.completeAndAutoHide(
+                host.bossBar.completeAndAutoHide(
                     player = target,
                     key = "alias_${target.uniqueId}",
-                    title = context.messages.renderRaw(msg),
+                    title = host.messages.renderRaw(msg),
                     color = color,
                     delayTicks = seconds * 20L,
                 )
@@ -155,11 +151,11 @@ object SpecializedCommandExecutor {
                 val cmd = resolved.removePrefix("/").trim()
                 if (cmd.isNotEmpty()) {
                     if (player != null) {
-                        context.scheduler.runForEntity(player) {
+                        host.scheduler.runForEntity(player) {
                             Bukkit.dispatchCommand(player, cmd)
                         }
                     } else {
-                        context.scheduler.runGlobal {
+                        host.scheduler.runGlobal {
                             Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd)
                         }
                     }

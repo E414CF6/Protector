@@ -1,16 +1,13 @@
 package protector
 
 import org.bukkit.plugin.Plugin
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertNotNull
-import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
-import protector.core.command.ProtectorCommandRegistry
+import protector.core.command.CommandRegistry
 import protector.core.config.ProtectorConfig
+import protector.core.module.FeatureModule
 import protector.core.module.ModuleRegistry
-import protector.core.module.ProtectorModule
-import protector.core.scheduler.ProtectorScheduler
+import protector.core.scheduler.PluginScheduler
 import java.lang.reflect.Proxy
 import java.util.logging.Logger
 
@@ -21,90 +18,65 @@ class ModuleAndSchedulerTest {
         val lifecycleEvents = mutableListOf<String>()
         val cfg = ProtectorConfig(
             moduleEnabledMap = mapOf(
-                "claim" to true,
+                "guard" to true,
                 "audit" to false
             )
         )
-        val registry = ModuleRegistry(proxyPlugin()) { cfg }
-        val commandRegistry = ProtectorCommandRegistry()
+        val registry = ModuleRegistry(proxyPlugin()) { id, def -> cfg.isModuleEnabled(id, def) }
+        val commandRegistry = CommandRegistry()
 
-        val claimModule = object : ProtectorModule {
-            override val id = "claim"
-            override val description = "Claim module"
-            override fun onEnable() {
-                lifecycleEvents += "enable:claim"
-            }
-
-            override fun onReload() {
-                lifecycleEvents += "reload:claim"
-            }
-
-            override fun onDisable() {
-                lifecycleEvents += "disable:claim"
-            }
-
-            override fun registerSubcommands(registry: ProtectorCommandRegistry) {
-                registry.registerSubcommand("claim", "Create claim", "protector.claim") { _, _ -> true }
+        val guardModule = object : FeatureModule {
+            override val id = "guard"
+            override val description = "Guard module"
+            override fun onEnable() { lifecycleEvents += "enable:guard" }
+            override fun onReload() { lifecycleEvents += "reload:guard" }
+            override fun onDisable() { lifecycleEvents += "disable:guard" }
+            override fun registerSubcommands(registry: CommandRegistry) {
+                registry.registerSubcommand("guard", "Configure guard", "protector.guard") { _, _ -> true }
             }
         }
 
-        val auditModule = object : ProtectorModule {
+        val auditModule = object : FeatureModule {
             override val id = "audit"
             override val description = "Audit module"
-            override fun onEnable() {
-                lifecycleEvents += "enable:audit"
-            }
-
-            override fun onReload() {
-                lifecycleEvents += "reload:audit"
-            }
-
-            override fun onDisable() {
-                lifecycleEvents += "disable:audit"
-            }
-
-            override fun registerSubcommands(registry: ProtectorCommandRegistry) {
+            override fun onEnable() { lifecycleEvents += "enable:audit" }
+            override fun registerSubcommands(registry: CommandRegistry) {
                 registry.registerSubcommand("inspect", "Inspect", "protector.inspect") { _, _ -> true }
             }
         }
 
-        val extraModule = object : ProtectorModule {
+        val extraModule = object : FeatureModule {
             override val id = "extra"
             override val description = "Extra module"
-            override fun onEnable() {
-                lifecycleEvents += "enable:extra"
-            }
-
-            override fun onDisable() {
-                lifecycleEvents += "disable:extra"
-            }
+            override fun onEnable() { lifecycleEvents += "enable:extra" }
+            override fun onDisable() { lifecycleEvents += "disable:extra" }
         }
 
-        registry.register(claimModule)
+        registry.register(guardModule)
         registry.register(auditModule)
         registry.register(extraModule)
 
         registry.enableAll()
-        assertTrue(registry.isActive("claim"))
+        assertTrue(registry.isActive("guard"))
         assertFalse(registry.isActive("audit"))
         assertTrue(registry.isActive("extra"))
 
         registry.registerAllSubcommands(commandRegistry)
-        assertNotNull(commandRegistry.getSubcommand("claim"))
-        assertEquals(null, commandRegistry.getSubcommand("inspect"))
+        assertNotNull(commandRegistry.getSubcommand("guard"))
+        assertNull(commandRegistry.getSubcommand("inspect"))
 
         registry.reloadAll()
         registry.disableAll()
-        assertFalse(registry.isActive("claim"))
+        assertFalse(registry.isActive("guard"))
         assertEquals(
-            listOf("enable:claim", "enable:extra", "reload:claim", "disable:extra", "disable:claim"),
+            listOf("enable:guard", "enable:extra", "reload:guard", "disable:extra", "disable:guard"),
             lifecycleEvents
         )
     }
 
     @Test
-    fun `ProtectorScheduler constructs safely headless and shuts down cleanly`() {
-        val scheduler = ProtectorScheduler(null)
+    fun `PluginScheduler constructs safely headless and shuts down cleanly`() {
+        val scheduler = PluginScheduler(null)
         assertFalse(scheduler.isFolia)
         scheduler.shutdown()
     }

@@ -3,13 +3,13 @@ version: '${version}'
 main: protector.Protector
 api-version: '1.20'
 folia-supported: true
-description: Integrated land protection, forensic audit logging, and modern UI plugin for Paper.
+description: Forensic audit logging, rollback engine, death-drop protection, and world TNT/fire/mob guard for Paper.
 authors: [ Protector ]
 
 commands:
   protector:
     description: Open the Protector dashboard GUI or execute subcommands
-    usage: /protector [claim|claims|settings|trust|untrust|extend|transfer|restrict|abandon|abandonall|unlockdrops|inspect|near|lookup|rollback|restore|apply|cancel|undo|purge|admin|status|reload|trapped|alias|aliases]
+    usage: /protector [guard|unlockdrops|inspect|near|lookup|rollback|restore|apply|cancel|undo|purge|consumer|admin|status|reload|alias|aliases]
     aliases: [ pr, pt ]
     permission: protector.use
 
@@ -17,9 +17,15 @@ permissions:
   protector.use:
     description: Access the Protector dashboard and basic commands
     default: true
-  protector.claim:
-    description: Create, abandon, and manage personal claims and trusts
+  protector.unlockdrops:
+    description: Unlock your protected death drops
     default: true
+  protector.guard:
+    description: View and configure world TNT, explosion, fire, and mob griefing guard rules
+    default: op
+  protector.bypass.guard:
+    description: Bypass global world guard restrictions (e.g. TNT priming)
+    default: op
   protector.inspect:
     description: Inspect block and container audit history
     default: op
@@ -35,14 +41,20 @@ permissions:
   protector.purge:
     description: Purge old audit logs
     default: op
+  protector.consumer:
+    description: Control the async audit log consumer queue
+    default: op
   protector.admin:
-    description: Bypass all claim protections, manage admin claims, and reload config
+    description: Full administrative access to Protector guard, audit, and config reload
     default: op
     children:
       protector.use: true
-      protector.claim: true
+      protector.unlockdrops: true
+      protector.guard: true
+      protector.bypass.guard: true
       protector.inspect: true
       protector.lookup: true
       protector.rollback: true
       protector.restore: true
       protector.purge: true
+      protector.consumer: true

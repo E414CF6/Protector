@@ -5,7 +5,7 @@ command-aliases:
   register-standalone-aliases: true
 
 modules:
-  claim:
+  guard:
     enabled: true
   audit:
     enabled: true
@@ -16,33 +16,31 @@ database:
   consumer-batch-size: 500
   consumer-flush-interval-ms: 500
 
-claims:
+guard:
   enabled-worlds: [] # Empty means enabled in all worlds
-  claim-tool: GOLDEN_SHOVEL
-  inspect-tool: STICK
-  initial-claim-blocks: 400
-  accrual-blocks-per-hour: 120
-  max-accrued-blocks: 80000
-  min-claim-width: 5
-  min-claim-area: 25
-  auto-claim-radius: 7
-  abandon-refund-ratio: 1.0
-  visualization-duration-seconds: 30
   protect-death-drops: true
-  limit-tree-growth: true
-  prevent-non-player-portals: true
-  unused-cleanup:
-    enabled: false
-    inactive-days: 60
-    max-area-to-expire: 2500
-  default-flags:
-    pvp: false
-    explosions: false
-    fire-spread: false
-    mob-griefing: false
-    public-access: false
-    piston-cross-border: false
-    entry-notify: true
+  tnt:
+    prevent-prime: false
+    prevent-block-damage: true
+    prevent-entity-damage: false
+    prevent-minecart-tnt: true
+  explosions:
+    prevent-creeper-block-damage: true
+    prevent-wither-damage: true
+    prevent-fireball-block-damage: true
+    prevent-end-crystal-damage: false
+    prevent-bed-anchor-explode: false
+  fire:
+    prevent-fire-spread: true
+    prevent-block-burn: true
+    prevent-lava-fire-spread: true
+    prevent-lightning-fire: true
+  mobs:
+    prevent-enderman-grief: true
+    prevent-ravager-grief: true
+    prevent-wither-block-break: true
+  world:
+    prevent-non-player-portals: false
 
 audit:
   enabled: true
@@ -71,4 +69,3 @@ ui:
   bossbar:
     enabled: true
     show-mode-banner: true
-    show-territory-banner: false

@@ -1,5 +1,6 @@
-package protector.core.storage
+package protector.modules.audit
 
+import protector.core.storage.DatabaseManager
 import java.sql.PreparedStatement
 import java.util.UUID
 
@@ -220,13 +221,26 @@ data class LookupFilter(
     val centerZ: Int,
     val radius: Int = 10,
     val sinceEpochSec: Long = 0L,
+    val untilEpochSec: Long? = null,
     val userName: String? = null,
+    val users: Set<String> = emptySet(),
+    val excludedUsers: Set<String> = emptySet(),
     val includeMaterials: Set<String> = emptySet(),
     val excludeMaterials: Set<String> = emptySet(),
     val actionFilter: LookupActionFilter = LookupActionFilter.ALL,
+    val blockActionFilter: BlockLogAction? = null,
+    val containerActionFilter: ContainerLogAction? = null,
+    val textFilter: String? = null,
     val limit: Int = 500,
-    val rolledBackFilter: Boolean? = null
-)
+    val rolledBackFilter: Boolean? = null,
+    val globalWorld: Boolean = false,
+    val unboundedRadius: Boolean = false,
+    val previewRequested: Boolean = false,
+    val countOnly: Boolean = false,
+) {
+    fun effectiveUsers(): Set<String> =
+        if (users.isNotEmpty()) users else userName?.let { setOf(it) } ?: emptySet()
+}
 
 class AuditLogRepository(
     private val db: DatabaseManager,
@@ -532,20 +546,36 @@ class AuditLogRepository(
         }
     }
 
+    private fun resolveIncludedUserIds(filter: LookupFilter): List<Int>? {
+        val targetUsers = filter.effectiveUsers()
+        if (targetUsers.isEmpty()) return null
+        val resolved = targetUsers.mapNotNull { ids.findUserIdByName(it) }
+        return resolved
+    }
+
+    private fun resolveExcludedUserIds(filter: LookupFilter): Set<Int> =
+        filter.excludedUsers.mapNotNull { ids.findUserIdByName(it) }.toSet()
+
     fun queryBlockLogs(filter: LookupFilter, ascendingTime: Boolean = false): List<BlockLogRecord> {
-        val worldId = ids.worldId(filter.worldName) ?: return emptyList()
-        val userId = filter.userName?.let { ids.findUserIdByName(it) ?: return emptyList() }
+        val worldId = if (filter.globalWorld) null else (ids.worldId(filter.worldName) ?: return emptyList())
+        val userIds = resolveIncludedUserIds(filter)
+        if (userIds != null && userIds.isEmpty()) return emptyList()
+        val excludedIds = resolveExcludedUserIds(filter)
         val order = if (ascendingTime) "ASC" else "DESC"
 
         val sql = buildString {
             append(
                 """
-                SELECT id, time, user_id, x, y, z, old_material_id, old_blockdata_id, new_material_id, new_blockdata_id, action, rolled_back
+                SELECT id, time, user_id, world_id, x, y, z, old_material_id, old_blockdata_id, new_material_id, new_blockdata_id, action, rolled_back
                 FROM pt_block_logs
-                WHERE world_id = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? AND time >= ?
+                WHERE time >= ?
                 """.trimIndent()
             )
-            if (userId != null) append(" AND user_id = ?")
+            if (filter.untilEpochSec != null) append(" AND time <= ?")
+            if (worldId != null) append(" AND world_id = ?")
+            if (!filter.unboundedRadius) append(" AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ?")
+            if (userIds != null) append(" AND user_id IN (${userIds.joinToString(",") { "?" }})")
+            if (filter.blockActionFilter != null) append(" AND action = ?")
             if (filter.rolledBackFilter != null) append(" AND rolled_back = ?")
             append(" ORDER BY time $order, id $order LIMIT ?")
         }
@@ -553,21 +583,27 @@ class AuditLogRepository(
         return db.withConnection { conn ->
             conn.prepareStatement(sql).use { ps ->
                 var idx = 1
-                ps.setInt(idx++, worldId)
-                ps.setInt(idx++, filter.centerX - filter.radius)
-                ps.setInt(idx++, filter.centerX + filter.radius)
-                ps.setInt(idx++, filter.centerY - filter.radius)
-                ps.setInt(idx++, filter.centerY + filter.radius)
-                ps.setInt(idx++, filter.centerZ - filter.radius)
-                ps.setInt(idx++, filter.centerZ + filter.radius)
                 ps.setLong(idx++, filter.sinceEpochSec)
-                if (userId != null) ps.setInt(idx++, userId)
-                if (filter.rolledBackFilter != null) ps.setInt(idx++, if (filter.rolledBackFilter) 1 else 0)
+                filter.untilEpochSec?.let { ps.setLong(idx++, it) }
+                if (worldId != null) ps.setInt(idx++, worldId)
+                if (!filter.unboundedRadius) {
+                    ps.setInt(idx++, filter.centerX - filter.radius)
+                    ps.setInt(idx++, filter.centerX + filter.radius)
+                    ps.setInt(idx++, filter.centerY - filter.radius)
+                    ps.setInt(idx++, filter.centerY + filter.radius)
+                    ps.setInt(idx++, filter.centerZ - filter.radius)
+                    ps.setInt(idx++, filter.centerZ + filter.radius)
+                }
+                userIds?.forEach { ps.setInt(idx++, it) }
+                filter.blockActionFilter?.let { ps.setInt(idx++, it.code) }
+                filter.rolledBackFilter?.let { ps.setInt(idx++, if (it) 1 else 0) }
                 ps.setInt(idx, filter.limit)
 
                 ps.executeQuery().use { rs ->
                     val list = ArrayList<BlockLogRecord>()
                     while (rs.next()) {
+                        val uid = rs.getInt("user_id")
+                        if (uid in excludedIds) continue
                         val oldMat = ids.materialName(rs.getInt("old_material_id"))
                         val newMat = ids.materialName(rs.getInt("new_material_id"))
                         if (filter.includeMaterials.isNotEmpty() &&
@@ -581,8 +617,8 @@ class AuditLogRepository(
                             BlockLogRecord(
                                 id = rs.getLong("id"),
                                 timeSec = rs.getLong("time"),
-                                actorName = ids.userName(rs.getInt("user_id")),
-                                worldName = filter.worldName,
+                                actorName = ids.userName(uid),
+                                worldName = ids.worldName(rs.getInt("world_id")),
                                 x = rs.getInt("x"),
                                 y = rs.getInt("y"),
                                 z = rs.getInt("z"),
@@ -602,19 +638,25 @@ class AuditLogRepository(
     }
 
     fun queryContainerLogs(filter: LookupFilter, ascendingTime: Boolean = false): List<ContainerLogRecord> {
-        val worldId = ids.worldId(filter.worldName) ?: return emptyList()
-        val userId = filter.userName?.let { ids.findUserIdByName(it) ?: return emptyList() }
+        val worldId = if (filter.globalWorld) null else (ids.worldId(filter.worldName) ?: return emptyList())
+        val userIds = resolveIncludedUserIds(filter)
+        if (userIds != null && userIds.isEmpty()) return emptyList()
+        val excludedIds = resolveExcludedUserIds(filter)
         val order = if (ascendingTime) "ASC" else "DESC"
 
         val sql = buildString {
             append(
                 """
-                SELECT id, time, user_id, x, y, z, material_id, amount, item_nbt, action, rolled_back
+                SELECT id, time, user_id, world_id, x, y, z, material_id, amount, item_nbt, action, rolled_back
                 FROM pt_container_logs
-                WHERE world_id = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? AND time >= ?
+                WHERE time >= ?
                 """.trimIndent()
             )
-            if (userId != null) append(" AND user_id = ?")
+            if (filter.untilEpochSec != null) append(" AND time <= ?")
+            if (worldId != null) append(" AND world_id = ?")
+            if (!filter.unboundedRadius) append(" AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ?")
+            if (userIds != null) append(" AND user_id IN (${userIds.joinToString(",") { "?" }})")
+            if (filter.containerActionFilter != null) append(" AND action = ?")
             if (filter.rolledBackFilter != null) append(" AND rolled_back = ?")
             append(" ORDER BY time $order, id $order LIMIT ?")
         }
@@ -622,21 +664,27 @@ class AuditLogRepository(
         return db.withConnection { conn ->
             conn.prepareStatement(sql).use { ps ->
                 var idx = 1
-                ps.setInt(idx++, worldId)
-                ps.setInt(idx++, filter.centerX - filter.radius)
-                ps.setInt(idx++, filter.centerX + filter.radius)
-                ps.setInt(idx++, filter.centerY - filter.radius)
-                ps.setInt(idx++, filter.centerY + filter.radius)
-                ps.setInt(idx++, filter.centerZ - filter.radius)
-                ps.setInt(idx++, filter.centerZ + filter.radius)
                 ps.setLong(idx++, filter.sinceEpochSec)
-                if (userId != null) ps.setInt(idx++, userId)
-                if (filter.rolledBackFilter != null) ps.setInt(idx++, if (filter.rolledBackFilter) 1 else 0)
+                filter.untilEpochSec?.let { ps.setLong(idx++, it) }
+                if (worldId != null) ps.setInt(idx++, worldId)
+                if (!filter.unboundedRadius) {
+                    ps.setInt(idx++, filter.centerX - filter.radius)
+                    ps.setInt(idx++, filter.centerX + filter.radius)
+                    ps.setInt(idx++, filter.centerY - filter.radius)
+                    ps.setInt(idx++, filter.centerY + filter.radius)
+                    ps.setInt(idx++, filter.centerZ - filter.radius)
+                    ps.setInt(idx++, filter.centerZ + filter.radius)
+                }
+                userIds?.forEach { ps.setInt(idx++, it) }
+                filter.containerActionFilter?.let { ps.setInt(idx++, it.code) }
+                filter.rolledBackFilter?.let { ps.setInt(idx++, if (it) 1 else 0) }
                 ps.setInt(idx, filter.limit)
 
                 ps.executeQuery().use { rs ->
                     val list = ArrayList<ContainerLogRecord>()
                     while (rs.next()) {
+                        val uid = rs.getInt("user_id")
+                        if (uid in excludedIds) continue
                         val mat = ids.materialName(rs.getInt("material_id"))
                         if (filter.includeMaterials.isNotEmpty() && mat !in filter.includeMaterials) continue
                         if (filter.excludeMaterials.isNotEmpty() && mat in filter.excludeMaterials) continue
@@ -644,8 +692,8 @@ class AuditLogRepository(
                             ContainerLogRecord(
                                 id = rs.getLong("id"),
                                 timeSec = rs.getLong("time"),
-                                actorName = ids.userName(rs.getInt("user_id")),
-                                worldName = filter.worldName,
+                                actorName = ids.userName(uid),
+                                worldName = ids.worldName(rs.getInt("world_id")),
                                 x = rs.getInt("x"),
                                 y = rs.getInt("y"),
                                 z = rs.getInt("z"),
@@ -664,19 +712,24 @@ class AuditLogRepository(
     }
 
     fun queryEntityLogs(filter: LookupFilter, ascendingTime: Boolean = false): List<EntityLogRecord> {
-        val worldId = ids.worldId(filter.worldName) ?: return emptyList()
-        val userId = filter.userName?.let { ids.findUserIdByName(it) ?: return emptyList() }
+        val worldId = if (filter.globalWorld) null else (ids.worldId(filter.worldName) ?: return emptyList())
+        val userIds = resolveIncludedUserIds(filter)
+        if (userIds != null && userIds.isEmpty()) return emptyList()
+        val excludedIds = resolveExcludedUserIds(filter)
         val order = if (ascendingTime) "ASC" else "DESC"
 
         val sql = buildString {
             append(
                 """
-                SELECT id, time, user_id, x, y, z, entity_id, action, metadata, rolled_back
+                SELECT id, time, user_id, world_id, x, y, z, entity_id, action, metadata, rolled_back
                 FROM pt_entity_logs
-                WHERE world_id = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? AND time >= ?
+                WHERE time >= ?
                 """.trimIndent()
             )
-            if (userId != null) append(" AND user_id = ?")
+            if (filter.untilEpochSec != null) append(" AND time <= ?")
+            if (worldId != null) append(" AND world_id = ?")
+            if (!filter.unboundedRadius) append(" AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ?")
+            if (userIds != null) append(" AND user_id IN (${userIds.joinToString(",") { "?" }})")
             if (filter.rolledBackFilter != null) append(" AND rolled_back = ?")
             append(" ORDER BY time $order, id $order LIMIT ?")
         }
@@ -684,27 +737,32 @@ class AuditLogRepository(
         return db.withConnection { conn ->
             conn.prepareStatement(sql).use { ps ->
                 var idx = 1
-                ps.setInt(idx++, worldId)
-                ps.setInt(idx++, filter.centerX - filter.radius)
-                ps.setInt(idx++, filter.centerX + filter.radius)
-                ps.setInt(idx++, filter.centerY - filter.radius)
-                ps.setInt(idx++, filter.centerY + filter.radius)
-                ps.setInt(idx++, filter.centerZ - filter.radius)
-                ps.setInt(idx++, filter.centerZ + filter.radius)
                 ps.setLong(idx++, filter.sinceEpochSec)
-                if (userId != null) ps.setInt(idx++, userId)
-                if (filter.rolledBackFilter != null) ps.setInt(idx++, if (filter.rolledBackFilter) 1 else 0)
+                filter.untilEpochSec?.let { ps.setLong(idx++, it) }
+                if (worldId != null) ps.setInt(idx++, worldId)
+                if (!filter.unboundedRadius) {
+                    ps.setInt(idx++, filter.centerX - filter.radius)
+                    ps.setInt(idx++, filter.centerX + filter.radius)
+                    ps.setInt(idx++, filter.centerY - filter.radius)
+                    ps.setInt(idx++, filter.centerY + filter.radius)
+                    ps.setInt(idx++, filter.centerZ - filter.radius)
+                    ps.setInt(idx++, filter.centerZ + filter.radius)
+                }
+                userIds?.forEach { ps.setInt(idx++, it) }
+                filter.rolledBackFilter?.let { ps.setInt(idx++, if (it) 1 else 0) }
                 ps.setInt(idx, filter.limit)
 
                 ps.executeQuery().use { rs ->
                     val list = ArrayList<EntityLogRecord>()
                     while (rs.next()) {
+                        val uid = rs.getInt("user_id")
+                        if (uid in excludedIds) continue
                         list.add(
                             EntityLogRecord(
                                 id = rs.getLong("id"),
                                 timeSec = rs.getLong("time"),
-                                actorName = ids.userName(rs.getInt("user_id")),
-                                worldName = filter.worldName,
+                                actorName = ids.userName(uid),
+                                worldName = ids.worldName(rs.getInt("world_id")),
                                 x = rs.getInt("x"),
                                 y = rs.getInt("y"),
                                 z = rs.getInt("z"),
@@ -722,46 +780,60 @@ class AuditLogRepository(
     }
 
     fun querySignLogs(filter: LookupFilter): List<SignLogRecord> {
-        val worldId = ids.worldId(filter.worldName) ?: return emptyList()
-        val userId = filter.userName?.let { ids.findUserIdByName(it) ?: return emptyList() }
+        val worldId = if (filter.globalWorld) null else (ids.worldId(filter.worldName) ?: return emptyList())
+        val userIds = resolveIncludedUserIds(filter)
+        if (userIds != null && userIds.isEmpty()) return emptyList()
+        val excludedIds = resolveExcludedUserIds(filter)
+
         val sql = buildString {
             append(
                 """
-                SELECT id, time, user_id, x, y, z, side, lines_json, action, rolled_back
+                SELECT id, time, user_id, world_id, x, y, z, side, lines_json, action, rolled_back
                 FROM pt_sign_logs
-                WHERE world_id = ? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ? AND time >= ?
+                WHERE time >= ?
                 """.trimIndent()
             )
-            if (userId != null) append(" AND user_id = ?")
+            if (filter.untilEpochSec != null) append(" AND time <= ?")
+            if (worldId != null) append(" AND world_id = ?")
+            if (!filter.unboundedRadius) append(" AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? AND z BETWEEN ? AND ?")
+            if (userIds != null) append(" AND user_id IN (${userIds.joinToString(",") { "?" }})")
             append(" ORDER BY time DESC, id DESC LIMIT ?")
         }
         return db.withConnection { conn ->
             conn.prepareStatement(sql).use { ps ->
                 var idx = 1
-                ps.setInt(idx++, worldId)
-                ps.setInt(idx++, filter.centerX - filter.radius)
-                ps.setInt(idx++, filter.centerX + filter.radius)
-                ps.setInt(idx++, filter.centerY - filter.radius)
-                ps.setInt(idx++, filter.centerY + filter.radius)
-                ps.setInt(idx++, filter.centerZ - filter.radius)
-                ps.setInt(idx++, filter.centerZ + filter.radius)
                 ps.setLong(idx++, filter.sinceEpochSec)
-                if (userId != null) ps.setInt(idx++, userId)
+                filter.untilEpochSec?.let { ps.setLong(idx++, it) }
+                if (worldId != null) ps.setInt(idx++, worldId)
+                if (!filter.unboundedRadius) {
+                    ps.setInt(idx++, filter.centerX - filter.radius)
+                    ps.setInt(idx++, filter.centerX + filter.radius)
+                    ps.setInt(idx++, filter.centerY - filter.radius)
+                    ps.setInt(idx++, filter.centerY + filter.radius)
+                    ps.setInt(idx++, filter.centerZ - filter.radius)
+                    ps.setInt(idx++, filter.centerZ + filter.radius)
+                }
+                userIds?.forEach { ps.setInt(idx++, it) }
                 ps.setInt(idx, filter.limit)
                 ps.executeQuery().use { rs ->
                     val list = ArrayList<SignLogRecord>()
+                    val keyword = filter.textFilter?.lowercase()
                     while (rs.next()) {
+                        val uid = rs.getInt("user_id")
+                        if (uid in excludedIds) continue
+                        val linesJson = rs.getString("lines_json")
+                        if (keyword != null && !linesJson.lowercase().contains(keyword)) continue
                         list.add(
                             SignLogRecord(
                                 id = rs.getLong("id"),
                                 timeSec = rs.getLong("time"),
-                                actorName = ids.userName(rs.getInt("user_id")),
-                                worldName = filter.worldName,
+                                actorName = ids.userName(uid),
+                                worldName = ids.worldName(rs.getInt("world_id")),
                                 x = rs.getInt("x"),
                                 y = rs.getInt("y"),
                                 z = rs.getInt("z"),
                                 side = rs.getString("side"),
-                                linesJson = rs.getString("lines_json"),
+                                linesJson = linesJson,
                                 action = rs.getInt("action"),
                                 rolledBack = rs.getInt("rolled_back") != 0
                             )
@@ -777,7 +849,8 @@ class AuditLogRepository(
         sinceEpochSec: Long,
         userName: String? = null,
         commandsOnly: Boolean? = null,
-        limit: Int = 100
+        limit: Int = 100,
+        textFilter: String? = null,
     ): List<ChatLogRecord> {
         val userId = userName?.let { ids.findUserIdByName(it) ?: return emptyList() }
         val sql = buildString {
@@ -795,7 +868,10 @@ class AuditLogRepository(
                 ps.setInt(idx, limit)
                 ps.executeQuery().use { rs ->
                     val list = ArrayList<ChatLogRecord>()
+                    val keyword = textFilter?.lowercase()
                     while (rs.next()) {
+                        val message = rs.getString("message")
+                        if (keyword != null && !message.lowercase().contains(keyword)) continue
                         list.add(
                             ChatLogRecord(
                                 id = rs.getLong("id"),
@@ -806,7 +882,7 @@ class AuditLogRepository(
                                 y = rs.getInt("y"),
                                 z = rs.getInt("z"),
                                 isCommand = rs.getInt("is_command") != 0,
-                                message = rs.getString("message")
+                                message = message
                             )
                         )
                     }

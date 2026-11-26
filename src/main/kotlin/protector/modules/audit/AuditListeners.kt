@@ -6,11 +6,13 @@ import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Tag
 import org.bukkit.block.Block
+import org.bukkit.block.DoubleChest
 import org.bukkit.block.Sign
 import org.bukkit.block.sign.Side
 import org.bukkit.entity.Ageable
 import org.bukkit.entity.Player
 import org.bukkit.entity.TNTPrimed
+import org.bukkit.entity.Tameable
 import org.bukkit.entity.Villager
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
@@ -28,10 +30,10 @@ import org.bukkit.event.player.*
 import org.bukkit.event.world.StructureGrowEvent
 import org.bukkit.inventory.BlockInventoryHolder
 import org.bukkit.inventory.EquipmentSlot
+import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
 import org.bukkit.material.Colorable
 import protector.core.config.ProtectorConfig
-import protector.core.storage.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
@@ -44,7 +46,7 @@ class AuditListeners(
 
     private data class ContainerSnapshot(
         val location: Location,
-        val counts: Map<Material, Int>
+        val counts: Map<String, Pair<ItemStack, Int>>
     )
 
     private val openContainers = ConcurrentHashMap<UUID, ContainerSnapshot>()
@@ -62,7 +64,6 @@ class AuditListeners(
         val p = event.player
         val time = nowSec()
 
-        // Capture sign lines before breaking so rollback can restore text
         val state = b.state
         if (cfg.logSigns && state is Sign) {
             for (side in Side.entries) {
@@ -117,7 +118,7 @@ class AuditListeners(
                         z = b.z,
                         material = item.type.name,
                         amount = item.amount,
-                        itemNbt = null,
+                        itemNbt = encodeItemUnit(item),
                         action = ContainerLogAction.REMOVE
                     )
                 )
@@ -129,6 +130,7 @@ class AuditListeners(
     fun onBlockPlace(event: BlockPlaceEvent) {
         val cfg = configProvider()
         if (!cfg.auditEnabled || !cfg.logBlocks) return
+        if (event is BlockMultiPlaceEvent) return
         val b = event.blockPlaced
         val prev = event.blockReplacedState
         val p = event.player
@@ -148,6 +150,33 @@ class AuditListeners(
                 action = BlockLogAction.PLACE
             )
         )
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    fun onBlockMultiPlace(event: BlockMultiPlaceEvent) {
+        val cfg = configProvider()
+        if (!cfg.auditEnabled || !cfg.logBlocks) return
+        val p = event.player
+        val time = nowSec()
+        for (prev in event.replacedBlockStates) {
+            val b = prev.block
+            consumer.enqueue(
+                PendingBlockEvent(
+                    timeSec = time,
+                    actorUuid = p.uniqueId,
+                    actorName = p.name,
+                    worldName = b.world.name,
+                    x = b.x,
+                    y = b.y,
+                    z = b.z,
+                    oldMaterial = prev.type.name,
+                    oldBlockData = prev.blockData.asString,
+                    newMaterial = b.type.name,
+                    newBlockData = b.blockData.asString,
+                    action = BlockLogAction.PLACE
+                )
+            )
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -358,8 +387,8 @@ class AuditListeners(
         val b = event.clickedBlock ?: return
         val type = b.type
         val interesting = b.state is BlockInventoryHolder || Tag.DOORS.isTagged(type) ||
-                Tag.TRAPDOORS.isTagged(type) || Tag.FENCE_GATES.isTagged(type) ||
-                Tag.BUTTONS.isTagged(type) || type == Material.LEVER
+            Tag.TRAPDOORS.isTagged(type) || Tag.FENCE_GATES.isTagged(type) ||
+            Tag.BUTTONS.isTagged(type) || type == Material.LEVER
         if (!interesting) return
 
         val p = event.player
@@ -408,9 +437,9 @@ class AuditListeners(
         val cfg = configProvider()
         if (!cfg.auditEnabled || !cfg.logContainers) return
         val player = event.player as? Player ?: return
-        val holder = event.inventory.holder as? BlockInventoryHolder ?: return
+        val loc = resolveContainerLocation(event.inventory) ?: return
         openContainers[player.uniqueId] = ContainerSnapshot(
-            location = holder.block.location.clone(),
+            location = loc.clone(),
             counts = summarizeItems(event.inventory.contents)
         )
     }
@@ -423,14 +452,17 @@ class AuditListeners(
         val snapshot = openContainers.remove(player.uniqueId) ?: return
         val after = summarizeItems(event.inventory.contents)
 
-        val allMaterials = snapshot.counts.keys + after.keys
+        val allKeys = snapshot.counts.keys + after.keys
         val loc = snapshot.location
         val worldName = loc.world?.name ?: return
         val time = nowSec()
 
-        for (mat in allMaterials) {
-            val delta = (after[mat] ?: 0) - (snapshot.counts[mat] ?: 0)
+        for (key in allKeys) {
+            val prevCount = snapshot.counts[key]?.second ?: 0
+            val nextCount = after[key]?.second ?: 0
+            val delta = nextCount - prevCount
             if (delta == 0) continue
+            val sampleItem = (after[key]?.first ?: snapshot.counts[key]?.first) ?: continue
             consumer.enqueue(
                 PendingContainerEvent(
                     timeSec = time,
@@ -440,9 +472,9 @@ class AuditListeners(
                     x = loc.blockX,
                     y = loc.blockY,
                     z = loc.blockZ,
-                    material = mat.name,
+                    material = sampleItem.type.name,
                     amount = kotlin.math.abs(delta),
-                    itemNbt = null,
+                    itemNbt = key,
                     action = if (delta > 0) ContainerLogAction.ADD else ContainerLogAction.REMOVE
                 )
             )
@@ -456,8 +488,9 @@ class AuditListeners(
         val item = event.item
         if (item.type.isAir) return
         val time = nowSec()
+        val encoded = encodeItemUnit(item)
 
-        val srcLoc = (event.source.holder as? BlockInventoryHolder)?.block?.location
+        val srcLoc = resolveContainerLocation(event.source)
         if (srcLoc != null) {
             consumer.enqueue(
                 PendingContainerEvent(
@@ -470,12 +503,12 @@ class AuditListeners(
                     z = srcLoc.blockZ,
                     material = item.type.name,
                     amount = item.amount,
-                    itemNbt = null,
+                    itemNbt = encoded,
                     action = ContainerLogAction.REMOVE
                 )
             )
         }
-        val dstLoc = (event.destination.holder as? BlockInventoryHolder)?.block?.location
+        val dstLoc = resolveContainerLocation(event.destination)
         if (dstLoc != null) {
             consumer.enqueue(
                 PendingContainerEvent(
@@ -488,7 +521,7 @@ class AuditListeners(
                     z = dstLoc.blockZ,
                     material = item.type.name,
                     amount = item.amount,
-                    itemNbt = null,
+                    itemNbt = encoded,
                     action = ContainerLogAction.ADD
                 )
             )
@@ -509,6 +542,7 @@ class AuditListeners(
         if (entity is Ageable) metaMap["adult"] = entity.isAdult
         if (entity is Colorable) entity.color?.name?.let { metaMap["color"] = it }
         if (entity is Villager) metaMap["profession"] = entity.profession.key().asString()
+        if (entity is Tameable && entity.isTamed) entity.ownerUniqueId?.let { metaMap["owner"] = it.toString() }
         entity.lastDamageCause?.cause?.name?.let { metaMap["cause"] = it }
 
         consumer.enqueue(
@@ -674,11 +708,30 @@ class AuditListeners(
         )
     }
 
-    private fun summarizeItems(contents: Array<ItemStack?>): Map<Material, Int> {
-        val counts = HashMap<Material, Int>()
+    private fun resolveContainerLocation(inventory: Inventory): Location? {
+        val holder = inventory.holder
+        if (holder is DoubleChest) {
+            return (holder.leftSide as? BlockInventoryHolder)?.block?.location ?: holder.location
+        }
+        if (holder is BlockInventoryHolder) {
+            return holder.block.location
+        }
+        return null
+    }
+
+    private fun encodeItemUnit(item: ItemStack): String? = runCatching {
+        val unit = item.clone().apply { amount = 1 }
+        Base64.getEncoder().encodeToString(unit.serializeAsBytes())
+    }.getOrNull()
+
+    private fun summarizeItems(contents: Array<ItemStack?>): Map<String, Pair<ItemStack, Int>> {
+        val counts = LinkedHashMap<String, Pair<ItemStack, Int>>()
         for (item in contents) {
-            if (item == null || item.type.isAir) continue
-            counts[item.type] = (counts[item.type] ?: 0) + item.amount
+            if (item == null || item.type.isAir || item.amount <= 0) continue
+            val unit = item.clone().apply { amount = 1 }
+            val key = encodeItemUnit(unit) ?: unit.type.name
+            val prev = counts[key]
+            counts[key] = unit to ((prev?.second ?: 0) + item.amount)
         }
         return counts
     }

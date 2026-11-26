@@ -6,17 +6,17 @@ import org.bukkit.Bukkit
 object PlatformCompat {
     val supportsDialogs: Boolean by lazy {
         hasClass("io.papermc.paper.dialog.Dialog") &&
-                hasClass("io.papermc.paper.registry.data.dialog.DialogBase") &&
-                runCatching {
-                    Audience::class.java.methods.any { it.name == "showDialog" }
-                }.getOrDefault(false)
+            hasClass("io.papermc.paper.registry.data.dialog.DialogBase") &&
+            runCatching {
+                Audience::class.java.methods.any { it.name == "showDialog" }
+            }.getOrDefault(false)
     }
 
     val supportsFoliaSchedulers: Boolean by lazy {
         hasClass("io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler") &&
-                runCatching {
-                    Bukkit::class.java.methods.any { it.name == "getGlobalRegionScheduler" }
-                }.getOrDefault(false)
+            runCatching {
+                Bukkit::class.java.methods.any { it.name == "getGlobalRegionScheduler" }
+            }.getOrDefault(false)
     }
 
     val supportsPaperAsyncChat: Boolean by lazy {

@@ -1,53 +1,105 @@
 package protector.modules.audit
 
-import org.bukkit.Material
 import org.bukkit.command.CommandSender
 import org.bukkit.entity.Player
 import org.bukkit.event.Listener
 import protector.core.ProtectorContext
-import protector.core.command.ProtectorCommandRegistry
+import protector.core.command.CommandRegistry
 import protector.core.command.SubcommandTabCompleter
 import protector.core.compat.PlatformCompat
-import protector.core.module.ProtectorModule
-import protector.core.storage.LookupActionFilter
-import protector.core.storage.LookupFilter
+import protector.core.module.FeatureModule
+import protector.modules.audit.ui.AuditDialogs
+import protector.modules.audit.ui.AuditMenus
+import java.util.Locale
 
-class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
+class AuditModule(
+    private val ctx: ProtectorContext,
+    dashboardOpener: (Player) -> Unit,
+) : FeatureModule {
     override val id: String = "audit"
-    override val description: String = "Forensic block/container/entity/chat audit logging and rollback engine"
+    override val description: String = "Forensic block/container/entity/chat audit logging, inspector, and rollback engine"
+
+    val idMappingCache = IdMappingCache(ctx.database).apply { warmUp() }
+    val repository = AuditLogRepository(ctx.database, idMappingCache)
+    val consumer = LogQueueConsumer(repository, { ctx.config }, ctx.plugin.logger)
+    val rollbackService = RollbackService(
+        ctx.scheduler,
+        { ctx.config },
+        ctx.messages,
+        repository,
+        consumer,
+        ctx.bossBar,
+    )
+    val inspectorService = InspectorService(
+        ctx.scheduler,
+        ctx.messages,
+        repository,
+        consumer,
+        ctx.actionBar,
+    )
+
+    lateinit var menus: AuditMenus
+        private set
+    lateinit var dialogs: AuditDialogs
+        private set
+
+    init {
+        dialogs = AuditDialogs({ ctx.config }, ctx.messages, rollbackService, ctx.dialogs) { menus }
+        menus = AuditMenus(
+            ctx.scheduler,
+            ctx.messages,
+            repository,
+            consumer,
+            rollbackService,
+            { dialogs },
+            dashboardOpener,
+        )
+        inspectorService.onOpenInspectDialog = { player, loc, bLogs, cLogs ->
+            dialogs.openInspectDetailDialog(player, loc, bLogs, cLogs)
+        }
+    }
 
     override fun onEnable() {
-        ctx.logQueueConsumer.start()
+        consumer.start()
+        ctx.actionBar.registerHudProvider("audit_inspector", priority = 50) { player ->
+            if (inspectorService.isInspecting(player.uniqueId)) {
+                ctx.messages.render("inspect-hud")
+            } else {
+                null
+            }
+        }
     }
 
     override fun onDisable() {
-        ctx.logQueueConsumer.shutdownAndDrain()
+        ctx.actionBar.unregisterHudProvider("audit_inspector")
+        consumer.shutdownAndDrain()
     }
 
     override fun listeners(): List<Listener> {
-        val auditListeners = AuditListeners({ ctx.config }, ctx.logQueueConsumer)
-        val result = mutableListOf<Listener>(auditListeners, ctx.inspectorService)
+        val auditListeners = AuditListeners({ ctx.config }, consumer)
+        val result = mutableListOf<Listener>(auditListeners, inspectorService)
         result += if (PlatformCompat.supportsPaperAsyncChat) {
-            PaperChatAuditListener({ ctx.config }, ctx.logQueueConsumer)
+            PaperChatAuditListener({ ctx.config }, consumer)
         } else {
-            LegacyChatAuditListener({ ctx.config }, ctx.logQueueConsumer)
+            LegacyChatAuditListener({ ctx.config }, consumer)
         }
         if (PlatformCompat.supportsTntPrimeEvent) {
             result += TntPrimeAuditListener({ ctx.config }, auditListeners)
         }
         if (PlatformCompat.supportsTakeLecternBookEvent) {
-            result += LecternAuditListener({ ctx.config }, ctx.logQueueConsumer)
+            result += LecternAuditListener({ ctx.config }, consumer)
         }
         return result
     }
 
-    override fun registerSubcommands(registry: ProtectorCommandRegistry) {
+    override fun registerSubcommands(registry: CommandRegistry) {
         val filterCompleter = SubcommandTabCompleter { _, args ->
             val last = args.lastOrNull().orEmpty()
             listOf(
-                "u:", "t:1h", "t:24h", "r:15", "r:30",
-                "a:block", "a:container", "a:entity", "a:sign", "a:chat", "a:session",
-                "i:", "e:", "apply"
+                "u:", "-u:", "t:1h", "t:24h", "t:1d-1h", "r:15", "r:30", "r:#global",
+                "a:block", "a:+block", "a:-block", "a:container", "a:+container", "a:-container",
+                "a:entity", "a:sign", "a:chat", "a:session",
+                "i:", "e:", "f:", "#preview", "#count", "apply"
             ).filter { it.startsWith(last, ignoreCase = true) }
         }
 
@@ -58,7 +110,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
             aliases = listOf("i", "coi"),
         ) { sender, _ ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
-            ctx.inspectorService.toggleInspect(player)
+            inspectorService.toggleInspect(player)
             true
         }
 
@@ -66,6 +118,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
             name = "near",
             description = "Browse nearby audit logs in the GUI",
             permission = "protector.lookup",
+            standaloneByDefault = false,
         ) { sender, args ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
             val radius = args.firstOrNull()?.toIntOrNull()?.coerceIn(1, ctx.config.maxRollbackRadius) ?: 10
@@ -79,7 +132,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
                 sinceEpochSec = (System.currentTimeMillis() / 1000L) - 86400L,
                 limit = 150
             )
-            ctx.menus.openAuditBrowserAsync(player, filter, 0)
+            menus.openAuditBrowserAsync(player, filter, 0)
             true
         }
 
@@ -92,11 +145,15 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
         ) { sender, args ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
             if (args.isEmpty()) {
-                ctx.dialogs.openRollbackFilterDialog(player, restoreMode = false)
+                dialogs.openRollbackFilterDialog(player, restoreMode = false)
                 return@registerSubcommand true
             }
             val filter = parseLookupArgs(player, args)
-            ctx.menus.openAuditBrowserAsync(player, filter, 0)
+            if (filter.countOnly) {
+                rollbackService.countMatches(player, filter)
+            } else {
+                menus.openAuditBrowserAsync(player, filter, 0)
+            }
             true
         }
 
@@ -109,14 +166,18 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
         ) { sender, args ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
             if (args.isEmpty()) {
-                ctx.dialogs.openRollbackFilterDialog(player, restoreMode = false)
+                dialogs.openRollbackFilterDialog(player, restoreMode = false)
                 return@registerSubcommand true
             }
             val filter = parseLookupArgs(player, args)
-            if (args.any { it.equals("apply", ignoreCase = true) || it.equals("now", ignoreCase = true) }) {
-                ctx.rollbackService.executeDirect(player, filter, restoreMode = false)
+            if (filter.countOnly) {
+                rollbackService.countMatches(player, filter)
+            } else if (!filter.previewRequested &&
+                args.any { it.equals("apply", ignoreCase = true) || it.equals("now", ignoreCase = true) }
+            ) {
+                rollbackService.executeDirect(player, filter, restoreMode = false)
             } else {
-                ctx.rollbackService.startPreview(player, filter, restoreMode = false)
+                rollbackService.startPreview(player, filter, restoreMode = false)
             }
             true
         }
@@ -130,14 +191,18 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
         ) { sender, args ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
             if (args.isEmpty()) {
-                ctx.dialogs.openRollbackFilterDialog(player, restoreMode = true)
+                dialogs.openRollbackFilterDialog(player, restoreMode = true)
                 return@registerSubcommand true
             }
             val filter = parseLookupArgs(player, args)
-            if (args.any { it.equals("apply", ignoreCase = true) || it.equals("now", ignoreCase = true) }) {
-                ctx.rollbackService.executeDirect(player, filter, restoreMode = true)
+            if (filter.countOnly) {
+                rollbackService.countMatches(player, filter)
+            } else if (!filter.previewRequested &&
+                args.any { it.equals("apply", ignoreCase = true) || it.equals("now", ignoreCase = true) }
+            ) {
+                rollbackService.executeDirect(player, filter, restoreMode = true)
             } else {
-                ctx.rollbackService.startPreview(player, filter, restoreMode = true)
+                rollbackService.startPreview(player, filter, restoreMode = true)
             }
             true
         }
@@ -148,7 +213,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
             permission = "protector.rollback",
         ) { sender, _ ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
-            if (!ctx.rollbackService.applyPreview(player)) {
+            if (!rollbackService.applyPreview(player)) {
                 ctx.messages.sendRaw(player, "<yellow>No active rollback or restore preview to apply.</yellow>")
             }
             true
@@ -156,14 +221,13 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
 
         registry.registerSubcommand(
             name = "cancel",
-            description = "Cancel an active rollback preview or claim selection",
-            permission = "protector.use",
+            description = "Cancel an active rollback or restore preview",
+            permission = "protector.rollback",
+            standaloneByDefault = false,
         ) { sender, _ ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
-            val cancelledPreview = ctx.rollbackService.cancelPreview(player)
-            ctx.claimToolService.cancelSelection(player)
-            if (!cancelledPreview) {
-                ctx.messages.sendRaw(player, "<gray>Cleared active selection.</gray>")
+            if (!rollbackService.cancelPreview(player)) {
+                ctx.messages.sendRaw(player, "<gray>No active rollback preview to cancel.</gray>")
             }
             true
         }
@@ -174,7 +238,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
             permission = "protector.rollback",
         ) { sender, _ ->
             val player = requirePlayer(sender) ?: return@registerSubcommand true
-            ctx.rollbackService.undoLast(player)
+            rollbackService.undoLast(player)
             true
         }
 
@@ -186,7 +250,7 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
             val durationToken = args.firstOrNull { it.startsWith("t:", ignoreCase = true) }?.substring(2)
                 ?: args.firstOrNull()
                 ?: "30d"
-            val seconds = RollbackService.parseDurationSeconds(durationToken)
+            val seconds = AuditFilterParser.parseDurationSeconds(durationToken)
             if (seconds == null) {
                 ctx.messages.sendRaw(sender, "<red>Invalid duration format. Example: /pr purge 30d</red>")
                 return@registerSubcommand true
@@ -199,78 +263,64 @@ class AuditModule(private val ctx: ProtectorContext) : ProtectorModule {
                     "<gray>Permanently delete all audit logs older than <white>$durationToken</white>.\nThis action cannot be undone.</gray>",
                     "<red>Purge</red>"
                 ) { p ->
-                    ctx.rollbackService.purgeBefore(p, p, seconds)
+                    rollbackService.purgeBefore(p, p, seconds)
                 }
             } else {
-                ctx.rollbackService.purgeBefore(sender, null, seconds)
+                rollbackService.purgeBefore(sender, null, seconds)
             }
             true
         }
 
         registry.registerSubcommand(
-            name = "status",
-            description = "View claims and audit log consumer status",
-            permission = "protector.inspect",
-        ) { sender, _ ->
-            val claimsCount = ctx.claimManager.getAllTopLevelClaims().size
-            ctx.messages.sendRaw(
-                sender,
-                "<aqua>Protector Status</aqua> <gray>|</gray> Claims: <white>$claimsCount</white> " +
-                        "<gray>|</gray> Pending Queue: <white>${ctx.logQueueConsumer.pendingCount()}</white> " +
-                        "<gray>|</gray> Total Logged: <white>${ctx.logQueueConsumer.totalProcessed.get()}</white>"
-            )
+            name = "consumer",
+            description = "Control or inspect the async audit log consumer queue",
+            permission = "protector.consumer",
+            standaloneByDefault = false,
+            tabCompleter = SubcommandTabCompleter { _, args ->
+                if (args.size <= 1) {
+                    listOf("status", "pause", "resume", "flush")
+                        .filter { it.startsWith(args.firstOrNull().orEmpty(), ignoreCase = true) }
+                } else emptyList()
+            },
+        ) { sender, args ->
+            when (args.firstOrNull()?.lowercase(Locale.ROOT) ?: "status") {
+                "pause" -> {
+                    consumer.paused.set(true)
+                    ctx.messages.send(sender, "consumer-state", mapOf("state" to "PAUSED"))
+                }
+                "resume", "unpause" -> {
+                    consumer.paused.set(false)
+                    ctx.messages.send(sender, "consumer-state", mapOf("state" to "ACTIVE"))
+                }
+                "flush" -> {
+                    ctx.scheduler.runAsync {
+                        val flushed = consumer.flushNow()
+                        ctx.scheduler.runGlobal {
+                            ctx.messages.send(sender, "consumer-flushed", mapOf("count" to flushed))
+                        }
+                    }
+                }
+                else -> {
+                    val state = if (consumer.paused.get()) "PAUSED" else "ACTIVE"
+                    ctx.messages.sendRaw(
+                        sender,
+                        "<aqua>Consumer:</aqua> <white>$state</white> <gray>| Pending:</gray> <white>${consumer.pendingCount()}</white> <gray>| Processed:</gray> <white>${consumer.totalProcessed.get()}</white>"
+                    )
+                }
+            }
             true
         }
     }
 
     private fun parseLookupArgs(player: Player, args: Array<out String>): LookupFilter {
-        val cfg = ctx.config
-        var user: String? = null
-        var seconds = 3600L
-        var radius = 15
-        var actionFilter = LookupActionFilter.ALL
-        val include = HashSet<String>()
-        val exclude = HashSet<String>()
-
-        for (arg in args) {
-            val idx = arg.indexOf(':')
-            if (idx <= 0) continue
-            val key = arg.substring(0, idx).lowercase()
-            val value = arg.substring(idx + 1)
-            when (key) {
-                "u", "user" -> user = value
-                "t", "time" -> RollbackService.parseDurationSeconds(value)?.let { seconds = it }
-                "r", "radius" -> value.toIntOrNull()?.let { radius = it.coerceIn(1, cfg.maxRollbackRadius) }
-                "i", "include" -> value.split(',').mapNotNull { Material.matchMaterial(it)?.name }
-                    .forEach { include.add(it) }
-
-                "e", "exclude" -> value.split(',').mapNotNull { Material.matchMaterial(it)?.name }
-                    .forEach { exclude.add(it) }
-
-                "a", "action" -> actionFilter = when (value.lowercase()) {
-                    "block", "blocks" -> LookupActionFilter.BLOCK
-                    "container", "chest" -> LookupActionFilter.CONTAINER
-                    "entity", "kill" -> LookupActionFilter.ENTITY
-                    "sign", "signs" -> LookupActionFilter.SIGN
-                    "chat", "command", "cmd" -> LookupActionFilter.CHAT
-                    "session", "login" -> LookupActionFilter.SESSION
-                    else -> LookupActionFilter.ALL
-                }
-            }
-        }
         val loc = player.location
-        return LookupFilter(
-            worldName = loc.world.name,
+        return AuditFilterParser.parseArgs(
+            args = args,
+            defaultWorld = loc.world.name,
             centerX = loc.blockX,
             centerY = loc.blockY,
             centerZ = loc.blockZ,
-            radius = radius,
-            sinceEpochSec = (System.currentTimeMillis() / 1000L) - seconds,
-            userName = user,
-            includeMaterials = include,
-            excludeMaterials = exclude,
-            actionFilter = actionFilter,
-            limit = 2000
+            maxRadius = ctx.config.maxRollbackRadius,
         )
     }
 

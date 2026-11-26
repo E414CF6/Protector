@@ -11,23 +11,17 @@ fun interface SubcommandTabCompleter {
     fun complete(sender: CommandSender, args: Array<out String>): List<String>
 }
 
-/**
- * Metadata and handler for a subcommand registered beneath `/protector` (`/pr`, `/pt`).
- */
 data class RegisteredSubcommand(
     val name: String,
     val description: String,
     val permission: String?,
     val aliases: List<String>,
+    val standaloneByDefault: Boolean = true,
     val executor: SubcommandExecutor,
     val tabCompleter: SubcommandTabCompleter? = null,
 )
 
-/**
- * Central registry holding all Protector module subcommands beneath `/protector`
- * (modeled after Obsidian's ObsidianCommandRegistry).
- */
-class ProtectorCommandRegistry {
+class CommandRegistry {
 
     private val subcommands = LinkedHashMap<String, RegisteredSubcommand>()
     private val aliasLookup = LinkedHashMap<String, String>()
@@ -42,6 +36,7 @@ class ProtectorCommandRegistry {
         description: String,
         permission: String? = null,
         aliases: Collection<String> = emptyList(),
+        standaloneByDefault: Boolean = true,
         tabCompleter: SubcommandTabCompleter? = null,
         executor: SubcommandExecutor,
     ) {
@@ -55,6 +50,7 @@ class ProtectorCommandRegistry {
             description = description,
             permission = permission,
             aliases = cleanAliases,
+            standaloneByDefault = standaloneByDefault,
             executor = executor,
             tabCompleter = tabCompleter,
         )

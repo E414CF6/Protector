@@ -1,6 +1,5 @@
 package protector.modules.audit
 
-import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
@@ -8,50 +7,62 @@ import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.block.Action
 import org.bukkit.event.player.PlayerInteractEvent
+import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.BlockInventoryHolder
 import org.bukkit.inventory.EquipmentSlot
 import protector.core.locale.MessageService
-import protector.core.scheduler.ProtectorScheduler
-import protector.core.storage.AuditLogRepository
-import protector.core.storage.BlockLogRecord
-import protector.core.storage.ContainerLogRecord
-import protector.core.ui.ActionBarHudService
+import protector.core.scheduler.PluginScheduler
+import protector.core.ui.ActionBarService
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class InspectorService(
-    private val scheduler: ProtectorScheduler,
+    private val scheduler: PluginScheduler,
     private val messages: MessageService,
     private val repository: AuditLogRepository,
     private val consumer: LogQueueConsumer,
-    private val actionBar: ActionBarHudService
+    private val actionBar: ActionBarService,
 ) : Listener {
     var onOpenInspectDialog: ((Player, Location, List<BlockLogRecord>, List<ContainerLogRecord>) -> Unit)? = null
 
+    private val inspectingPlayers = ConcurrentHashMap.newKeySet<UUID>()
     private val timeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
         .withZone(ZoneId.systemDefault())
 
-    fun toggleInspect(player: Player): Boolean {
-        val st = actionBar.state(player.uniqueId)
-        st.inspectMode = !st.inspectMode
-        if (st.inspectMode) {
+    fun isInspecting(uuid: UUID): Boolean = uuid in inspectingPlayers
+
+    fun setInspecting(player: Player, enabled: Boolean) {
+        if (enabled) {
+            inspectingPlayers.add(player.uniqueId)
             messages.send(player, "inspect-enabled")
         } else {
+            inspectingPlayers.remove(player.uniqueId)
             messages.send(player, "inspect-disabled")
         }
         actionBar.tickPlayer(player)
-        return st.inspectMode
+    }
+
+    fun toggleInspect(player: Player): Boolean {
+        val next = !isInspecting(player.uniqueId)
+        setInspecting(player, next)
+        return next
+    }
+
+    @EventHandler
+    fun onQuit(event: PlayerQuitEvent) {
+        inspectingPlayers.remove(event.player.uniqueId)
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
     fun onInspectClick(event: PlayerInteractEvent) {
         if (event.hand != EquipmentSlot.HAND) return
         val player = event.player
-        val st = actionBar.state(player.uniqueId)
-        if (!st.inspectMode) return
+        if (!isInspecting(player.uniqueId)) return
         if (!player.hasPermission("protector.inspect")) {
-            st.inspectMode = false
+            inspectingPlayers.remove(player.uniqueId)
             return
         }
 
@@ -85,7 +96,6 @@ class InspectorService(
                     return@runForEntity
                 }
 
-                // Shift + Click opens rich Paper Dialog directly; normal click sends compact summary + hint
                 if (isSneaking && onOpenInspectDialog != null) {
                     onOpenInspectDialog?.invoke(player, loc, blockLogs, containerLogs)
                     return@runForEntity

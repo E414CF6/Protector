@@ -1,4 +1,4 @@
-package protector.modules.claim
+package protector.modules.guard
 
 import org.bukkit.NamespacedKey
 import org.bukkit.entity.Item
@@ -12,17 +12,18 @@ import org.bukkit.event.inventory.InventoryPickupItemEvent
 import org.bukkit.event.inventory.InventoryType
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.plugin.java.JavaPlugin
-import protector.core.locale.MessageService
 import protector.core.config.ProtectorConfig
-import protector.core.ui.ActionBarHudService
-import java.util.UUID
+import protector.core.locale.MessageService
+import protector.core.ui.ActionBarService
+import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
 class DeathDropProtectionService(
     plugin: JavaPlugin,
     private val configProvider: () -> ProtectorConfig,
     private val messages: MessageService,
-    private val actionBar: ActionBarHudService
+    private val actionBar: ActionBarService,
+    private val adminBypassCheck: (Player) -> Boolean,
 ) : Listener {
     private val ownerKey = NamespacedKey(plugin, "death_drop_owner")
     private val ownerNameKey = NamespacedKey(plugin, "death_drop_owner_name")
@@ -50,9 +51,8 @@ class DeathDropProtectionService(
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     fun onPlayerDeath(event: PlayerDeathEvent) {
         val cfg = configProvider()
-        if (!cfg.protectDeathDrops || event.keepInventory || event.drops.isEmpty()) return
+        if (!cfg.guard.protectDeathDrops || event.keepInventory || event.drops.isEmpty()) return
         val player = event.entity
-        // If killed by another player in PvP, do not lock PvP loot
         if (player.killer != null && player.killer?.uniqueId != player.uniqueId) return
 
         val loc = player.location
@@ -78,8 +78,7 @@ class DeathDropProtectionService(
         val entity = event.entity
         if (entity is Player) {
             if (entity.uniqueId == ownerId) return
-            val st = actionBar.state(entity.uniqueId)
-            if (st.adminBypass && entity.hasPermission("protector.admin")) return
+            if (adminBypassCheck(entity)) return
 
             val ownerName = event.item.persistentDataContainer.get(ownerNameKey, PersistentDataType.STRING) ?: "Player"
             actionBar.sendDenial(entity, "drops-locked-deny", mapOf("owner" to ownerName))

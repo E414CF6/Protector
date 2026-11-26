@@ -1,10 +1,34 @@
 package protector.core.config
 
-import org.bukkit.Material
 import org.bukkit.configuration.file.FileConfiguration
 import org.bukkit.plugin.java.JavaPlugin
-import protector.modules.claim.ClaimFlag
+import protector.core.ui.ActionBarSettings
 import java.util.Locale
+
+data class GuardSettings(
+    val enabledWorlds: Set<String> = emptySet(),
+    val protectDeathDrops: Boolean = true,
+    val tntPreventPrime: Boolean = false,
+    val tntPreventBlockDamage: Boolean = true,
+    val tntPreventEntityDamage: Boolean = false,
+    val tntPreventMinecart: Boolean = true,
+    val preventCreeperBlockDamage: Boolean = true,
+    val preventWitherDamage: Boolean = true,
+    val preventFireballBlockDamage: Boolean = true,
+    val preventEndCrystalDamage: Boolean = false,
+    val preventBedAnchorExplode: Boolean = false,
+    val preventFireSpread: Boolean = true,
+    val preventBlockBurn: Boolean = true,
+    val preventLavaFireSpread: Boolean = true,
+    val preventLightningFire: Boolean = true,
+    val preventEndermanGrief: Boolean = true,
+    val preventRavagerGrief: Boolean = true,
+    val preventWitherBlockBreak: Boolean = true,
+    val preventNonPlayerPortals: Boolean = false,
+) {
+    fun isWorldEnabled(worldName: String): Boolean =
+        enabledWorlds.isEmpty() || enabledWorlds.contains(worldName)
+}
 
 data class ProtectorConfig(
     val language: String = "en",
@@ -14,24 +38,7 @@ data class ProtectorConfig(
     val databasePoolSize: Int = 4,
     val consumerBatchSize: Int = 500,
     val consumerFlushIntervalMs: Long = 500L,
-    val enabledWorlds: Set<String> = emptySet(),
-    val claimTool: Material = Material.GOLDEN_SHOVEL,
-    val inspectTool: Material = Material.STICK,
-    val initialClaimBlocks: Int = 400,
-    val accrualBlocksPerHour: Int = 120,
-    val maxAccruedBlocks: Int = 80000,
-    val minClaimWidth: Int = 5,
-    val minClaimArea: Int = 25,
-    val autoClaimRadius: Int = 7,
-    val abandonRefundRatio: Double = 1.0,
-    val visualizationDurationSeconds: Int = 30,
-    val protectDeathDrops: Boolean = true,
-    val limitTreeGrowth: Boolean = true,
-    val preventNonPlayerPortals: Boolean = true,
-    val unusedCleanupEnabled: Boolean = false,
-    val unusedCleanupInactiveDays: Int = 60,
-    val unusedCleanupMaxArea: Int = 2500,
-    val defaultFlags: Map<ClaimFlag, Boolean> = mapOf(ClaimFlag.ENTRY_NOTIFY to true),
+    val guard: GuardSettings = GuardSettings(),
     val auditEnabled: Boolean = true,
     val logBlocks: Boolean = true,
     val logContainers: Boolean = true,
@@ -54,13 +61,15 @@ data class ProtectorConfig(
     val denialCooldownMs: Long = 1500L,
     val bossBarEnabled: Boolean = true,
     val bossBarModeBanner: Boolean = true,
-    val bossBarTerritoryBanner: Boolean = false
 ) {
-    fun isWorldEnabled(worldName: String): Boolean =
-        enabledWorlds.isEmpty() || enabledWorlds.contains(worldName)
-
     fun isModuleEnabled(id: String, defaultEnabled: Boolean = true): Boolean =
         moduleEnabledMap[id.lowercase(Locale.ROOT)] ?: defaultEnabled
+
+    fun actionBarSettings(): ActionBarSettings = ActionBarSettings(
+        enabled = actionBarEnabled,
+        refreshTicks = actionBarRefreshTicks,
+        denialCooldownMs = denialCooldownMs,
+    )
 
     companion object {
         fun load(plugin: JavaPlugin): ProtectorConfig {
@@ -76,14 +85,26 @@ data class ProtectorConfig(
                 }
             }
 
-            val flags = mapOf(
-                ClaimFlag.PVP to cfg.getBoolean("claims.default-flags.pvp", false),
-                ClaimFlag.EXPLOSIONS to cfg.getBoolean("claims.default-flags.explosions", false),
-                ClaimFlag.FIRE_SPREAD to cfg.getBoolean("claims.default-flags.fire-spread", false),
-                ClaimFlag.MOB_GRIEFING to cfg.getBoolean("claims.default-flags.mob-griefing", false),
-                ClaimFlag.PUBLIC_ACCESS to cfg.getBoolean("claims.default-flags.public-access", false),
-                ClaimFlag.PISTON_CROSS_BORDER to cfg.getBoolean("claims.default-flags.piston-cross-border", false),
-                ClaimFlag.ENTRY_NOTIFY to cfg.getBoolean("claims.default-flags.entry-notify", true)
+            val guard = GuardSettings(
+                enabledWorlds = cfg.getStringList("guard.enabled-worlds").toSet(),
+                protectDeathDrops = cfg.getBoolean("guard.protect-death-drops", true),
+                tntPreventPrime = cfg.getBoolean("guard.tnt.prevent-prime", false),
+                tntPreventBlockDamage = cfg.getBoolean("guard.tnt.prevent-block-damage", true),
+                tntPreventEntityDamage = cfg.getBoolean("guard.tnt.prevent-entity-damage", false),
+                tntPreventMinecart = cfg.getBoolean("guard.tnt.prevent-minecart-tnt", true),
+                preventCreeperBlockDamage = cfg.getBoolean("guard.explosions.prevent-creeper-block-damage", true),
+                preventWitherDamage = cfg.getBoolean("guard.explosions.prevent-wither-damage", true),
+                preventFireballBlockDamage = cfg.getBoolean("guard.explosions.prevent-fireball-block-damage", true),
+                preventEndCrystalDamage = cfg.getBoolean("guard.explosions.prevent-end-crystal-damage", false),
+                preventBedAnchorExplode = cfg.getBoolean("guard.explosions.prevent-bed-anchor-explode", false),
+                preventFireSpread = cfg.getBoolean("guard.fire.prevent-fire-spread", true),
+                preventBlockBurn = cfg.getBoolean("guard.fire.prevent-block-burn", true),
+                preventLavaFireSpread = cfg.getBoolean("guard.fire.prevent-lava-fire-spread", true),
+                preventLightningFire = cfg.getBoolean("guard.fire.prevent-lightning-fire", true),
+                preventEndermanGrief = cfg.getBoolean("guard.mobs.prevent-enderman-grief", true),
+                preventRavagerGrief = cfg.getBoolean("guard.mobs.prevent-ravager-grief", true),
+                preventWitherBlockBreak = cfg.getBoolean("guard.mobs.prevent-wither-block-break", true),
+                preventNonPlayerPortals = cfg.getBoolean("guard.world.prevent-non-player-portals", false),
             )
 
             return ProtectorConfig(
@@ -94,26 +115,7 @@ data class ProtectorConfig(
                 databasePoolSize = cfg.getInt("database.pool-size", 4).coerceAtLeast(1),
                 consumerBatchSize = cfg.getInt("database.consumer-batch-size", 500).coerceAtLeast(50),
                 consumerFlushIntervalMs = cfg.getLong("database.consumer-flush-interval-ms", 500L).coerceAtLeast(100L),
-                enabledWorlds = cfg.getStringList("claims.enabled-worlds").toSet(),
-                claimTool = Material.matchMaterial(cfg.getString("claims.claim-tool") ?: "GOLDEN_SHOVEL")
-                    ?: Material.GOLDEN_SHOVEL,
-                inspectTool = Material.matchMaterial(cfg.getString("claims.inspect-tool") ?: "STICK")
-                    ?: Material.STICK,
-                initialClaimBlocks = cfg.getInt("claims.initial-claim-blocks", 400).coerceAtLeast(0),
-                accrualBlocksPerHour = cfg.getInt("claims.accrual-blocks-per-hour", 120).coerceAtLeast(0),
-                maxAccruedBlocks = cfg.getInt("claims.max-accrued-blocks", 80000).coerceAtLeast(100),
-                minClaimWidth = cfg.getInt("claims.min-claim-width", 5).coerceAtLeast(1),
-                minClaimArea = cfg.getInt("claims.min-claim-area", 25).coerceAtLeast(1),
-                autoClaimRadius = cfg.getInt("claims.auto-claim-radius", 7).coerceAtLeast(2),
-                abandonRefundRatio = cfg.getDouble("claims.abandon-refund-ratio", 1.0).coerceIn(0.0, 1.0),
-                visualizationDurationSeconds = cfg.getInt("claims.visualization-duration-seconds", 30).coerceAtLeast(5),
-                protectDeathDrops = cfg.getBoolean("claims.protect-death-drops", true),
-                limitTreeGrowth = cfg.getBoolean("claims.limit-tree-growth", true),
-                preventNonPlayerPortals = cfg.getBoolean("claims.prevent-non-player-portals", true),
-                unusedCleanupEnabled = cfg.getBoolean("claims.unused-cleanup.enabled", false),
-                unusedCleanupInactiveDays = cfg.getInt("claims.unused-cleanup.inactive-days", 60).coerceAtLeast(1),
-                unusedCleanupMaxArea = cfg.getInt("claims.unused-cleanup.max-area-to-expire", 2500).coerceAtLeast(1),
-                defaultFlags = flags,
+                guard = guard,
                 auditEnabled = cfg.getBoolean("audit.enabled", true),
                 logBlocks = cfg.getBoolean("audit.log-blocks", true),
                 logContainers = cfg.getBoolean("audit.log-containers", true),
@@ -136,7 +138,6 @@ data class ProtectorConfig(
                 denialCooldownMs = cfg.getLong("ui.actionbar.denial-cooldown-ms", 1500L).coerceAtLeast(200L),
                 bossBarEnabled = cfg.getBoolean("ui.bossbar.enabled", true),
                 bossBarModeBanner = cfg.getBoolean("ui.bossbar.show-mode-banner", true),
-                bossBarTerritoryBanner = cfg.getBoolean("ui.bossbar.show-territory-banner", false)
             )
         }
     }

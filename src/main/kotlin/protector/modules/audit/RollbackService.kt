@@ -18,25 +18,17 @@ import org.bukkit.entity.Ageable
 import org.bukkit.entity.EntityType
 import org.bukkit.entity.Monster
 import org.bukkit.entity.Player
+import org.bukkit.entity.Tameable
 import org.bukkit.entity.Villager
 import org.bukkit.inventory.BlockInventoryHolder
 import org.bukkit.inventory.ItemStack
 import org.bukkit.material.Colorable
 import protector.core.config.ProtectorConfig
 import protector.core.locale.MessageService
-import protector.core.scheduler.ProtectorScheduler
+import protector.core.scheduler.PluginScheduler
 import protector.core.scheduler.TaskHandle
-import protector.core.storage.AuditLogRepository
-import protector.core.storage.BlockLogAction
-import protector.core.storage.BlockLogRecord
-import protector.core.storage.ContainerLogAction
-import protector.core.storage.ContainerLogRecord
-import protector.core.storage.EntityLogAction
-import protector.core.storage.EntityLogRecord
-import protector.core.storage.LookupActionFilter
-import protector.core.storage.LookupFilter
-import protector.core.storage.SignLogRecord
 import protector.core.ui.BossBarService
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -60,6 +52,7 @@ data class ContainerEditPlan(
     val z: Int,
     val material: String,
     val amount: Int,
+    val itemNbt: String?,
     val addItems: Boolean
 )
 
@@ -97,7 +90,7 @@ data class UndoRecord(
 )
 
 class RollbackService(
-    private val scheduler: ProtectorScheduler,
+    private val scheduler: PluginScheduler,
     private val configProvider: () -> ProtectorConfig,
     private val messages: MessageService,
     private val repository: AuditLogRepository,
@@ -115,24 +108,22 @@ class RollbackService(
         private const val PROGRESS_BAR_KEY = "rollback_progress"
         private const val PURGE_BAR_KEY = "purge_progress"
 
-        fun parseDurationSeconds(token: String): Long? {
-            val regex = Regex("(\\d+)([smhdw])", RegexOption.IGNORE_CASE)
-            val matches = regex.findAll(token.trim()).toList()
-            if (matches.isEmpty()) return null
-            var total = 0L
-            for (m in matches) {
-                val value = m.groupValues[1].toLongOrNull() ?: continue
-                val mult = when (m.groupValues[2].lowercase()) {
-                    "s" -> 1L
-                    "m" -> 60L
-                    "h" -> 3600L
-                    "d" -> 86400L
-                    "w" -> 604800L
-                    else -> 0L
-                }
-                total += value * mult
+        fun parseDurationSeconds(token: String): Long? =
+            AuditFilterParser.parseDurationSeconds(token)
+    }
+
+    fun countMatches(player: Player, filter: LookupFilter) {
+        scheduler.runAsync {
+            consumer.flushNow()
+            val bundle = queryBundle(filter, restoreMode = false)
+            scheduler.runForEntity(player) {
+                if (!player.isOnline) return@runForEntity
+                messages.sendRaw(
+                    player,
+                    "<green>Matching audit records: <white>${bundle.totalCount}</white> " +
+                        "<gray>(Blocks ${bundle.blockPlans.size}, Containers ${bundle.containerPlans.size}, Entities ${bundle.entityPlans.size})</gray></green>"
+                )
             }
-            return total.takeIf { it > 0L }
         }
     }
 
@@ -150,9 +141,9 @@ class RollbackService(
                     messages.send(player, "rollback-no-matches")
                     return@runForEntity
                 }
-                val world = Bukkit.getWorld(effectiveFilter.worldName) ?: return@runForEntity
                 val previewLocs = ArrayList<Location>(minOf(bundle.blockPlans.size, 4000))
                 for (plan in bundle.blockPlans.take(4000)) {
+                    val world = Bukkit.getWorld(plan.worldName) ?: continue
                     val loc = Location(world, plan.x.toDouble(), plan.y.toDouble(), plan.z.toDouble())
                     val data = parseBlockData(plan.targetMaterial, plan.targetBlockData)
                     runCatching {
@@ -168,15 +159,17 @@ class RollbackService(
 
                 previews[player.uniqueId] = PendingPreview(effectiveFilter, restoreMode, bundle, previewLocs, expireTask)
                 val label = if (restoreMode) "Restore" else "Rollback"
-                bossBar.showOrUpdate(
-                    player,
-                    PREVIEW_BAR_KEY,
-                    messages.renderRaw(
-                        "<aqua>👁 $label Preview (Blocks ${bundle.blockPlans.size} · Containers ${bundle.containerPlans.size} · Entities ${bundle.entityPlans.size}) — <white>/pr apply</white> | <white>/pr cancel</white></aqua>"
-                    ),
-                    1.0f,
-                    BossBar.Color.BLUE
-                )
+                if (configProvider().bossBarModeBanner) {
+                    bossBar.showOrUpdate(
+                        player,
+                        PREVIEW_BAR_KEY,
+                        messages.renderRaw(
+                            "<aqua>👁 $label Preview (Blocks ${bundle.blockPlans.size} · Containers ${bundle.containerPlans.size} · Entities ${bundle.entityPlans.size}) — <white>/pr apply</white> | <white>/pr cancel</white></aqua>"
+                        ),
+                        1.0f,
+                        BossBar.Color.BLUE
+                    )
+                }
                 messages.send(player, "rollback-preview-started", mapOf("count" to bundle.totalCount))
             }
         }
@@ -323,7 +316,6 @@ class RollbackService(
 
         var taskRef: TaskHandle? = null
         taskRef = scheduler.runGlobalTimer(1L, 1L) {
-            // Phase 1: Blocks + Signs
             if (blockCursor < bundle.blockPlans.size) {
                 val end = minOf(blockCursor + perTick, bundle.blockPlans.size)
                 while (blockCursor < end) {
@@ -346,7 +338,6 @@ class RollbackService(
                 }
             }
 
-            // Phase 2: Containers (once blocks/chests are restored)
             if (blockCursor >= bundle.blockPlans.size && !containerDone) {
                 containerDone = true
                 for (c in bundle.containerPlans) {
@@ -357,7 +348,6 @@ class RollbackService(
                 }
             }
 
-            // Phase 3: Entities
             if (blockCursor >= bundle.blockPlans.size && containerDone && !entitiesDone) {
                 entitiesDone = true
                 for (e in bundle.entityPlans) {
@@ -426,13 +416,14 @@ class RollbackService(
         val world = Bukkit.getWorld(plan.worldName) ?: return
         val block = world.getBlockAt(plan.x, plan.y, plan.z)
         val holder = block.state as? BlockInventoryHolder ?: return
-        val mat = Material.matchMaterial(plan.material)?.takeIf { it.isItem && !it.isAir } ?: return
+        val template = decodeItemTemplate(plan.itemNbt, plan.material) ?: return
+        val mat = template.type
         val inv = holder.inventory
         var remaining = plan.amount
         if (plan.addItems) {
             while (remaining > 0) {
                 val stackAmt = minOf(remaining, mat.maxStackSize)
-                inv.addItem(ItemStack(mat, stackAmt))
+                inv.addItem(template.clone().apply { amount = stackAmt })
                 remaining -= stackAmt
             }
         } else {
@@ -449,6 +440,18 @@ class RollbackService(
                 remaining -= take
             }
         }
+    }
+
+    private fun decodeItemTemplate(itemNbt: String?, materialName: String): ItemStack? {
+        if (!itemNbt.isNullOrBlank()) {
+            runCatching {
+                val bytes = Base64.getDecoder().decode(itemNbt)
+                val stack = ItemStack.deserializeBytes(bytes)
+                if (!stack.type.isAir && stack.type.isItem) return stack
+            }
+        }
+        val mat = Material.matchMaterial(materialName)?.takeIf { it.isItem && !it.isAir } ?: return null
+        return ItemStack(mat)
     }
 
     private fun respawnEntity(plan: EntityRespawnPlan) {
@@ -479,48 +482,48 @@ class RollbackService(
                 }
             }
         }
+        if (spawned is Tameable) {
+            (meta["owner"] as? String)?.let { uuidStr ->
+                runCatching {
+                    spawned.isTamed = true
+                    spawned.owner = Bukkit.getOfflinePlayer(UUID.fromString(uuidStr))
+                }
+            }
+        }
     }
 
-    private fun buildBlockPlans(logs: List<BlockLogRecord>, restoreMode: Boolean): List<BlockEditPlan> {
-        val plans = ArrayList<BlockEditPlan>(logs.size)
-        for (log in logs) {
+    private fun buildBlockPlans(logs: List<BlockLogRecord>, restoreMode: Boolean): List<BlockEditPlan> =
+        logs.map { log ->
             if (restoreMode) {
-                plans.add(
-                    BlockEditPlan(
-                        logId = log.id,
-                        worldName = log.worldName,
-                        x = log.x,
-                        y = log.y,
-                        z = log.z,
-                        targetMaterial = log.newMaterial,
-                        targetBlockData = log.newBlockData,
-                        revertMaterial = log.oldMaterial,
-                        revertBlockData = log.oldBlockData
-                    )
+                BlockEditPlan(
+                    logId = log.id,
+                    worldName = log.worldName,
+                    x = log.x,
+                    y = log.y,
+                    z = log.z,
+                    targetMaterial = log.newMaterial,
+                    targetBlockData = log.newBlockData,
+                    revertMaterial = log.oldMaterial,
+                    revertBlockData = log.oldBlockData
                 )
             } else {
-                plans.add(
-                    BlockEditPlan(
-                        logId = log.id,
-                        worldName = log.worldName,
-                        x = log.x,
-                        y = log.y,
-                        z = log.z,
-                        targetMaterial = log.oldMaterial,
-                        targetBlockData = log.oldBlockData,
-                        revertMaterial = log.newMaterial,
-                        revertBlockData = log.newBlockData
-                    )
+                BlockEditPlan(
+                    logId = log.id,
+                    worldName = log.worldName,
+                    x = log.x,
+                    y = log.y,
+                    z = log.z,
+                    targetMaterial = log.oldMaterial,
+                    targetBlockData = log.oldBlockData,
+                    revertMaterial = log.newMaterial,
+                    revertBlockData = log.newBlockData
                 )
             }
         }
-        return plans
-    }
 
     private fun buildContainerPlans(logs: List<ContainerLogRecord>, restoreMode: Boolean): List<ContainerEditPlan> =
         logs.map { log ->
             val wasRemoved = log.action == ContainerLogAction.REMOVE
-            // Rollback: if removed -> add back; if added -> remove. Restore: opposite.
             val addItems = if (restoreMode) !wasRemoved else wasRemoved
             ContainerEditPlan(
                 logId = log.id,
@@ -530,6 +533,7 @@ class RollbackService(
                 z = log.z,
                 material = log.material,
                 amount = log.amount,
+                itemNbt = log.itemNbt,
                 addItems = addItems
             )
         }

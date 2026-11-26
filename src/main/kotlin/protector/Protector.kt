@@ -4,15 +4,12 @@ import org.bukkit.Bukkit
 import org.bukkit.plugin.ServicePriority
 import org.bukkit.plugin.java.JavaPlugin
 import protector.core.ProtectorContext
-import protector.core.command.ProtectorCommand
+import protector.core.command.RootCommandExecutor
 import protector.core.compat.PlatformCompat
+import protector.core.ui.MenuListener
 import protector.modules.audit.AuditModule
-import protector.modules.claim.ClaimModule
+import protector.modules.guard.GuardModule
 
-/**
- * Protector plugin entrypoint bootstrapping [ProtectorContext], feature modules, and dynamic command aliases
- * (modeled after Obsidian's ObsidianPlugin).
- */
 class Protector : JavaPlugin() {
 
     var context: ProtectorContext? = null
@@ -26,19 +23,36 @@ class Protector : JavaPlugin() {
         context = ctx
         Bukkit.getServicesManager().register(ProtectorContext::class.java, ctx, this, ServicePriority.Normal)
 
+        lateinit var dashboard: ProtectorDashboard
+        val guardModule = GuardModule(ctx) { dashboard.openDashboard(it) }
+        val auditModule = AuditModule(ctx) { dashboard.openDashboard(it) }
+        dashboard = ProtectorDashboard(ctx, guardModule, auditModule)
+
         val pm = server.pluginManager
-        pm.registerEvents(ctx.menus, this)
+        pm.registerEvents(MenuListener(), this)
         pm.registerEvents(ctx.commandAliases, this)
         ctx.actionBar.start()
 
-        // Register feature modules in dependency order
-        ctx.modules.register(ClaimModule(ctx))
-        ctx.modules.register(AuditModule(ctx))
+        ctx.modules.register(guardModule)
+        ctx.modules.register(auditModule)
         ctx.modules.enableAll()
 
-        // Populate central subcommand registry & initialize dynamic CommandMap aliases
         ctx.commandRegistry.clear()
-        val rootExecutor = ProtectorCommand(ctx)
+        val rootExecutor = RootCommandExecutor(
+            host = ctx,
+            commandAliases = ctx.commandAliases,
+            userPermission = "protector.use",
+            openDashboard = { dashboard.openDashboard(it) },
+            openAdminPanel = { dashboard.openAdminPanel(it) },
+            statusReporter = { sender ->
+                ctx.messages.sendRaw(
+                    sender,
+                    "<aqua>Protector Status</aqua> <gray>|</gray> Guard Rules: <white>${guardModule.activeRuleCount()}</white> " +
+                        "<gray>|</gray> Pending Queue: <white>${auditModule.consumer.pendingCount()}</white> " +
+                        "<gray>|</gray> Total Logged: <white>${auditModule.consumer.totalProcessed.get()}</white>"
+                )
+            },
+        )
         rootExecutor.registerCoreSubcommands()
         ctx.modules.registerAllSubcommands(ctx.commandRegistry)
 

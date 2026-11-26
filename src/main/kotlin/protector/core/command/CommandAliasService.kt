@@ -14,28 +14,21 @@ import org.bukkit.event.player.PlayerCommandPreprocessEvent
 import org.bukkit.event.server.RemoteServerCommandEvent
 import org.bukkit.event.server.ServerCommandEvent
 import org.bukkit.event.server.TabCompleteEvent
-import protector.core.ProtectorContext
+import protector.core.CoreHost
 import java.io.File
 import java.lang.reflect.Method
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * Obsidian/CMI-style dynamic command alias manager (`command-aliases.yml` + `aliases.yml`).
- *
- * Only `/protector` (`/pr`, `/pt`) is registered in `plugin.yml`. All subcommand standalone
- * aliases (`/claim`, `/trust`, `/inspect`, `/rollback`, etc.) and custom user aliases are
- * dynamically registered into `CommandMap` and routed via preprocess/tab-complete handlers.
- */
-class CommandAliasService(private val context: ProtectorContext) : Listener {
+class CommandAliasService(private val host: CoreHost) : Listener {
 
-    private val commandAliasFile = File(context.plugin.dataFolder, "command-aliases.yml")
-    private val customAliasFile = File(context.plugin.dataFolder, "aliases.yml")
+    private val commandAliasFile = File(host.plugin.dataFolder, "command-aliases.yml")
+    private val customAliasFile = File(host.plugin.dataFolder, "aliases.yml")
 
     private val regularAliases = LinkedHashMap<String, CommandAliasEntry>()
     private val customAliases = LinkedHashMap<String, CommandAliasEntry>()
     private val disabledBaseSubcommands = ConcurrentHashMap.newKeySet<String>()
-    private val registeredCommands = LinkedHashMap<String, ProtectorAliasCommand>()
+    private val registeredCommands = LinkedHashMap<String, AliasCommandProxy>()
 
     @Volatile
     private var combinedAliases: Map<String, CommandAliasEntry> = emptyMap()
@@ -56,7 +49,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
     }
 
     fun reload() {
-        if (context.commandRegistry.allSubcommands().isEmpty()) {
+        if (host.commandRegistry.allSubcommands().isEmpty()) {
             loadCustomAliases()
             rebuildCache()
             return
@@ -87,7 +80,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         val cleanName = name.trim().lowercase(Locale.ROOT).removePrefix("/")
         if (cleanName.isEmpty()) return
         if (commands.any { it.trim().removePrefix("/").equals(cleanName, ignoreCase = true) }) {
-            context.plugin.logger.warning("Ignored recursive custom alias '/$cleanName'.")
+            host.plugin.logger.warning("Ignored recursive custom alias '/$cleanName'.")
             return
         }
         synchronized(this) {
@@ -100,7 +93,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             )
             rebuildCache()
         }
-        context.scheduler.runAsync { saveCustomAliases() }
+        host.scheduler.runAsync { saveCustomAliases() }
         reregisterCommandMapAliases(syncClients = true)
     }
 
@@ -112,7 +105,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             ex
         }
         if (removed) {
-            context.scheduler.runAsync { saveCustomAliases() }
+            host.scheduler.runAsync { saveCustomAliases() }
             reregisterCommandMapAliases(syncClients = true)
         }
         return removed
@@ -125,33 +118,34 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             YamlConfiguration()
         }
 
+        val rootName = host.rootCommandName
+        val rootLabels = (listOf(rootName) + host.rootAliases).joinToString(", ") { "/$it" }
         yaml.options().setHeader(
             listOf(
-                "Protector Dynamic Command Alias Configuration (Obsidian/CMI-style)",
-                "All Protector commands are anchored under /protector (<subcommand>) (aliases: /pr, /pt).",
-                "Standalone commands below (e.g. /claim, /trust, /inspect, /rollback) are dynamically registered.",
-                "Set 'enabled: false' for any alias to disable its standalone command and avoid plugin conflicts.",
+                "${host.pluginDisplayName} Dynamic Command Alias Configuration",
+                "All commands are anchored under /$rootName (<subcommand>) (aliases: $rootLabels).",
+                "Set 'enabled: true/false' to toggle standalone CommandMap registration.",
                 "Set 'tab: false' to disable tab completion for a standalone alias.",
-                "Set 'base-disabled: true' to disable '/protector <subcommand>' while keeping the standalone alias.",
+                "Set 'base-disabled: true' to disable '/$rootName <subcommand>' while keeping the standalone alias.",
             )
         )
 
         val newRegular = LinkedHashMap<String, CommandAliasEntry>()
         val newDisabledBase = HashSet<String>()
         var modified = !commandAliasFile.exists()
-        val standaloneDefault = context.config.registerStandaloneAliases
+        val standaloneDefault = host.registerStandaloneAliases
 
-        for (sub in context.commandRegistry.allSubcommands()) {
+        for (sub in host.commandRegistry.allSubcommands()) {
             val primaryPath = "aliases.${sub.name}"
-            val primaryTarget = "protector ${sub.name} $1-"
+            val primaryTarget = "$rootName ${sub.name} $1-"
             if (!yaml.isConfigurationSection(primaryPath)) {
                 yaml.set("$primaryPath.command", primaryTarget)
-                yaml.set("$primaryPath.enabled", true)
+                yaml.set("$primaryPath.enabled", sub.standaloneByDefault)
                 yaml.set("$primaryPath.tab", true)
                 yaml.set("$primaryPath.base-disabled", false)
                 modified = true
             }
-            val primaryEnabled = yaml.getBoolean("$primaryPath.enabled", true)
+            val primaryEnabled = yaml.getBoolean("$primaryPath.enabled", sub.standaloneByDefault)
             val primaryTab = yaml.getBoolean("$primaryPath.tab", true)
             val primaryBaseDisabled = yaml.getBoolean("$primaryPath.base-disabled", false)
             val primaryCmd = yaml.getString("$primaryPath.command", primaryTarget) ?: primaryTarget
@@ -173,14 +167,14 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             for (secAlias in sub.aliases) {
                 if (newRegular.containsKey(secAlias)) continue
                 val secPath = "aliases.$secAlias"
-                val secTarget = "protector ${sub.name} $1-"
+                val secTarget = "$rootName ${sub.name} $1-"
                 if (!yaml.isConfigurationSection(secPath)) {
                     yaml.set("$secPath.command", secTarget)
-                    yaml.set("$secPath.enabled", true)
+                    yaml.set("$secPath.enabled", sub.standaloneByDefault)
                     yaml.set("$secPath.tab", true)
                     modified = true
                 }
-                val secEnabled = yaml.getBoolean("$secPath.enabled", true)
+                val secEnabled = yaml.getBoolean("$secPath.enabled", sub.standaloneByDefault)
                 val secTab = yaml.getBoolean("$secPath.tab", true)
                 val secCmd = yaml.getString("$secPath.command", secTarget) ?: secTarget
 
@@ -200,7 +194,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
                 commandAliasFile.parentFile?.mkdirs()
                 yaml.save(commandAliasFile)
             }.onFailure { err ->
-                context.plugin.logger.warning("Failed to save command-aliases.yml: ${err.message}")
+                host.plugin.logger.warning("Failed to save command-aliases.yml: ${err.message}")
             }
         }
 
@@ -263,7 +257,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
                 }
                 if (entry != null) {
                     if (entry.commands.any { it.trim().removePrefix("/").equals(key, ignoreCase = true) }) {
-                        context.plugin.logger.warning("Ignored recursive custom alias '/$key'.")
+                        host.plugin.logger.warning("Ignored recursive custom alias '/$key'.")
                     } else {
                         loaded[key] = entry
                     }
@@ -278,13 +272,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
     }
 
     private fun createDefaultCustomAliases() {
-        val defaults = linkedMapOf(
-            "myclaims" to listOf("player: protector claims"),
-            "claimsettings" to listOf("player: protector settings"),
-            "claimhelp" to listOf(
-                "msg: <aqua><bold>Protector Guide:</bold></aqua> <gray>Use <white>/pr</white> for the dashboard or <white>/claim</white> to protect your land.</gray>"
-            ),
-        )
+        val defaults = host.defaultCustomAliases
         val yaml = YamlConfiguration()
         for ((k, v) in defaults) {
             yaml.set("aliases.$k", v)
@@ -342,16 +330,21 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             }.getOrNull()
         }
 
+    private fun rootTokens(): Set<String> =
+        (setOf(host.rootCommandName.lowercase(Locale.ROOT)) + host.rootAliases.map { it.lowercase(Locale.ROOT) })
+
     @Synchronized
     private fun reregisterCommandMapAliases(syncClients: Boolean) {
         val commandMap = resolveCommandMap() ?: return
         unregisterCommandMapAliases()
 
+        val roots = rootTokens()
+        val namespace = host.rootCommandName.lowercase(Locale.ROOT)
         val baseEntries = LinkedHashMap<String, CommandAliasEntry>()
         for (entry in combinedAliases.values) {
             if (!entry.enabled) continue
             val base = entry.baseCommand
-            if (base.isEmpty() || base == "protector" || base == "pr" || base == "pt") continue
+            if (base.isEmpty() || base in roots) continue
             val existing = baseEntries[base]
             if (existing == null || (existing.type == CommandAliasType.CUSTOM && entry.type != CommandAliasType.CUSTOM)) {
                 baseEntries[base] = entry
@@ -360,10 +353,10 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
 
         for ((base, entry) in baseEntries) {
             val desc = entry.targetSubcommand?.let {
-                context.commandRegistry.getSubcommand(it)?.description
-            }.orEmpty().ifEmpty { "Protector command alias" }
-            val proxy = ProtectorAliasCommand(base, this, desc)
-            commandMap.register("protector", proxy)
+                host.commandRegistry.getSubcommand(it)?.description
+            }.orEmpty().ifEmpty { "${host.pluginDisplayName} command alias" }
+            val proxy = AliasCommandProxy(base, this, desc)
+            commandMap.register(namespace, proxy)
             registeredCommands[base] = proxy
         }
 
@@ -377,11 +370,12 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         if (registeredCommands.isEmpty()) return
         val commandMap = resolveCommandMap() ?: return
         val known: MutableMap<String, Command>? = runCatching { commandMap.knownCommands }.getOrNull()
+        val namespace = host.rootCommandName.lowercase(Locale.ROOT)
 
         for ((base, cmd) in registeredCommands) {
             if (known != null) {
                 if (known[base] === cmd) known.remove(base)
-                val namespaced = "protector:$base"
+                val namespaced = "$namespace:$base"
                 if (known[namespaced] === cmd) known.remove(namespaced)
             }
             cmd.unregister(commandMap)
@@ -396,7 +390,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         if (Bukkit.isPrimaryThread()) {
             Bukkit.getOnlinePlayers().forEach { it.updateCommands() }
         } else {
-            context.scheduler.runGlobal {
+            host.scheduler.runGlobal {
                 Bukkit.getOnlinePlayers().forEach { it.updateCommands() }
             }
         }
@@ -409,12 +403,12 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
 
         if (entry.type == CommandAliasType.CUSTOM) {
             if (!entry.requiresPerm) return true
-            return sender.hasPermission("protector.customalias.${entry.permissionKey}") ||
-                    sender.hasPermission("protector.admin")
+            return sender.hasPermission("${host.customAliasPermissionPrefix}${entry.permissionKey}") ||
+                sender.hasPermission(host.adminPermission)
         }
 
         val subName = entry.targetSubcommand ?: return true
-        val sub = context.commandRegistry.getSubcommand(subName) ?: return true
+        val sub = host.commandRegistry.getSubcommand(subName) ?: return true
         val perm = sub.permission ?: return true
         return sender.hasPermission(perm)
     }
@@ -426,16 +420,16 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         if (!entry.enabled) return false
 
         if (entry.type == CommandAliasType.CUSTOM && entry.requiresPerm &&
-            !sender.hasPermission("protector.customalias.${entry.permissionKey}") &&
-            !sender.hasPermission("protector.admin")
+            !sender.hasPermission("${host.customAliasPermissionPrefix}${entry.permissionKey}") &&
+            !sender.hasPermission(host.adminPermission)
         ) {
-            context.messages.send(sender, "no-permission")
+            host.messages.send(sender, "no-permission")
             return true
         }
 
         val depth = dispatchDepth.get()
         if (depth >= MAX_ALIAS_DISPATCH_DEPTH) {
-            context.plugin.logger.warning("Prevented recursive alias dispatch for '/$rawCommand'.")
+            host.plugin.logger.warning("Prevented recursive alias dispatch for '/$rawCommand'.")
             return false
         }
 
@@ -450,7 +444,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             } else {
                 val remainder = rawCommand.removePrefix(entry.alias).trim()
                 SpecializedCommandExecutor.executeAll(
-                    context,
+                    host,
                     expanded,
                     sender as? Player,
                     mapOf("args" to remainder, "player" to sender.name),
@@ -492,9 +486,9 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             val cleanTokens = clean.split(Regex("\\s+"))
             if (!AliasMatcher.isSpecializedAlias(entry.commands) &&
                 cleanTokens.size >= 2 &&
-                cleanTokens[0].lowercase(Locale.ROOT) in setOf("protector", "pr", "pt")
+                cleanTokens[0].lowercase(Locale.ROOT) in rootTokens()
             ) {
-                val sub = context.commandRegistry.getSubcommand(cleanTokens[1]) ?: return emptyList()
+                val sub = host.commandRegistry.getSubcommand(cleanTokens[1]) ?: return emptyList()
                 val combinedArgs = cleanTokens.drop(2) + args.toList()
                 return sub.tabCompleter?.complete(sender, combinedArgs.toTypedArray()).orEmpty()
             }
@@ -502,7 +496,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         }
 
         val subTarget = entry.targetSubcommand ?: return emptyList()
-        val sub = context.commandRegistry.getSubcommand(subTarget) ?: return emptyList()
+        val sub = host.commandRegistry.getSubcommand(subTarget) ?: return emptyList()
         if (sub.permission != null && !sender.hasPermission(sub.permission)) return emptyList()
         return sub.tabCompleter?.complete(sender, args).orEmpty()
     }
@@ -514,7 +508,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         val disabledSub = extractDisabledBaseSubcommand(raw)
         if (disabledSub != null) {
             event.isCancelled = true
-            context.messages.send(event.player, "command-disabled", mapOf("command" to disabledSub))
+            host.messages.send(event.player, "command-disabled", mapOf("command" to disabledSub))
             return
         }
 
@@ -522,11 +516,11 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         if (!entry.enabled) return
 
         if (entry.type == CommandAliasType.CUSTOM && entry.requiresPerm &&
-            !event.player.hasPermission("protector.customalias.${entry.permissionKey}") &&
-            !event.player.hasPermission("protector.admin")
+            !event.player.hasPermission("${host.customAliasPermissionPrefix}${entry.permissionKey}") &&
+            !event.player.hasPermission(host.adminPermission)
         ) {
             event.isCancelled = true
-            context.messages.send(event.player, "no-permission")
+            host.messages.send(event.player, "no-permission")
             return
         }
 
@@ -542,7 +536,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             event.isCancelled = true
             val remainder = raw.removePrefix(entry.alias).trim()
             SpecializedCommandExecutor.executeAll(
-                context,
+                host,
                 expanded,
                 event.player,
                 mapOf("args" to remainder, "player" to event.player.name),
@@ -556,7 +550,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         val disabledSub = extractDisabledBaseSubcommand(raw)
         if (disabledSub != null) {
             event.isCancelled = true
-            context.messages.send(event.sender, "command-disabled", mapOf("command" to disabledSub))
+            host.messages.send(event.sender, "command-disabled", mapOf("command" to disabledSub))
             return
         }
 
@@ -575,7 +569,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             event.isCancelled = true
             val remainder = raw.removePrefix(entry.alias).trim()
             SpecializedCommandExecutor.executeAll(
-                context,
+                host,
                 expanded,
                 null,
                 mapOf("args" to remainder, "player" to event.sender.name),
@@ -589,7 +583,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         val disabledSub = extractDisabledBaseSubcommand(raw)
         if (disabledSub != null) {
             event.isCancelled = true
-            context.messages.send(event.sender, "command-disabled", mapOf("command" to disabledSub))
+            host.messages.send(event.sender, "command-disabled", mapOf("command" to disabledSub))
             return
         }
 
@@ -608,7 +602,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
             event.isCancelled = true
             val remainder = raw.removePrefix(entry.alias).trim()
             SpecializedCommandExecutor.executeAll(
-                context,
+                host,
                 expanded,
                 null,
                 mapOf("args" to remainder, "player" to event.sender.name),
@@ -629,8 +623,8 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         for (entry in combinedAliases.values) {
             if (!entry.enabled || entry.type != CommandAliasType.CUSTOM || !entry.tabComplete) continue
             if (entry.requiresPerm &&
-                !event.sender.hasPermission("protector.customalias.${entry.permissionKey}") &&
-                !event.sender.hasPermission("protector.admin")
+                !event.sender.hasPermission("${host.customAliasPermissionPrefix}${entry.permissionKey}") &&
+                !event.sender.hasPermission(host.adminPermission)
             ) {
                 continue
             }
@@ -658,10 +652,11 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         trimmed = trimmed.trimStart()
         if (trimmed.isEmpty()) return null
 
+        val prefix = "${host.rootCommandName.lowercase(Locale.ROOT)}:"
         val firstSpace = trimmed.indexOf(' ')
         val firstToken = if (firstSpace < 0) trimmed else trimmed.substring(0, firstSpace)
-        val cleanFirst = if (firstToken.startsWith("protector:", ignoreCase = true)) {
-            firstToken.substring("protector:".length)
+        val cleanFirst = if (firstToken.startsWith(prefix, ignoreCase = true)) {
+            firstToken.substring(prefix.length)
         } else {
             firstToken
         }
@@ -672,7 +667,7 @@ class CommandAliasService(private val context: ProtectorContext) : Listener {
         val tokens = rawCommand.split(Regex("\\s+"), limit = 3)
         if (tokens.size < 2) return null
         val root = tokens[0].lowercase(Locale.ROOT)
-        if (root != "protector" && root != "pr" && root != "pt") return null
+        if (root !in rootTokens()) return null
         val sub = tokens[1].lowercase(Locale.ROOT)
         return if (isBaseDisabled(sub)) sub else null
     }
